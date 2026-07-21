@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Env / secrets
+.env
+
+# Data artifacts (raw pages, Parquet, DuckDB files) — never commit data
+data/
+*.parquet
+*.duckdb
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
