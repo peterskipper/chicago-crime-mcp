@@ -16,6 +16,9 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.scripts]
+chicago-crime-ingest = "chicago_crime_mcp.ingest.cli:main"
+
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
 store = [

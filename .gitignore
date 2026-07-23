@@ -10,8 +10,10 @@ venv/
 # Env / secrets
 .env
 
-# Data artifacts (raw pages, Parquet, DuckDB files) — never commit data
-data/
+# Data artifacts (raw pages, Parquet, DuckDB files) — never commit data.
+# Anchored to the repo root so it does NOT match committed package reference
+# data like src/chicago_crime_mcp/ingest/data/iucr_codes.csv.
+/data/
 *.parquet
 *.duckdb
 
