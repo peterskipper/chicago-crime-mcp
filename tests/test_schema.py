@@ -106,14 +106,12 @@ def test_coerce_types_casts_each_group():
             "domestic": [True],
             "latitude": ["41.9"],
             "longitude": ["-87.6"],
-            "year": ["2024"],
             "primary_type": ["THEFT"],
         }
     )
     out = schema.coerce_types(df)
 
     assert out["id"].dtype == "Int64" and out.loc[0, "id"] == 12345
-    assert out["year"].dtype == "Int64" and out.loc[0, "year"] == 2024
     assert out["latitude"].dtype == "float64"
     assert str(out["date"].dtype).startswith("datetime")
     # zero-padded codes survive as strings (would be lost as ints).

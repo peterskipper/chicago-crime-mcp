@@ -53,7 +53,10 @@ SELECT_FIELDS: list[str] = [
     "fbi_code",
     "x_coordinate",
     "y_coordinate",
-    "year",
+    # NOTE: the API also exposes a `year` field, but it is deliberately NOT
+    # pulled. It is redundant with the Hive partition (`year=<YYYY>`), which is
+    # derived from `date`; keeping an in-file `year` column would collide with
+    # the partition value DuckDB/Postgres synthesize on read (duplicate column).
     "updated_on",
     "latitude",
     "longitude",
@@ -67,7 +70,8 @@ _STRING_COLS = [
 ]
 _DATETIME_COLS = ["date", "updated_on"]
 _FLOAT_COLS = ["latitude", "longitude", "x_coordinate", "y_coordinate"]
-_INT_COLS = ["id", "year", "ward", "community_area"]
+# `year` is intentionally absent: it comes from the Hive partition, not the payload.
+_INT_COLS = ["id", "ward", "community_area"]
 _BOOL_COLS = ["arrest", "domestic"]
 # SODA returns booleans as JSON true/false, but older exports use the strings
 # "true"/"false" - map both, since "false" is otherwise truthy.
