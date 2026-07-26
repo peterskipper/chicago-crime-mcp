@@ -70,9 +70,30 @@ output:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"          # add [store] and [server] in later phases
+pip install -e ".[dev,store]"    # dev tooling + storage-layer deps ([server] lands in Phase 3)
 cp .env.example .env             # then paste your Socrata app token
 ```
+
+The `store` extra pulls the storage-layer drivers: `psycopg` (Postgres/PostGIS),
+`redis`, and `duckdb`.
+
+### Local storage stack (PostGIS + Redis)
+
+The storage layer routes across Postgres/PostGIS (point lookups + spatial
+queries) and Redis (cache-aside). `docker-compose.yml` brings both up locally:
+
+```bash
+docker compose up -d             # start PostGIS + Redis
+docker compose ps                # both should read "Up (healthy)"
+```
+
+- Ports bind to `127.0.0.1` only, so the default dev credentials (`crime:crime`,
+  and Redis' no-auth default) are not reachable off-machine.
+- On Apple Silicon the local Postgres uses `imresamu/postgis` — a multi-arch
+  rebuild of the amd64-only official PostGIS image (same PG 17 / PostGIS 3.5).
+- `StoreConfig.from_env()` defaults mirror the compose file, so a fresh checkout
+  connects with no `.env` changes; production overrides `DATABASE_URL` /
+  `REDIS_URL`.
 
 ### Explore the source data
 ```bash
