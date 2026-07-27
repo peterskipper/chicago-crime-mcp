@@ -102,6 +102,25 @@ def test_partition_columns_match_file(tmp_path):
     assert loader.partition_columns(path) == SCHEMA.names
 
 
+def test_select_partitions_filters_by_year(tmp_path):
+    _write_partition(tmp_path, 2024, [_row()])
+    _write_partition(tmp_path, 2025, [_row()])
+    _write_partition(tmp_path, 2026, [_row()])
+    sel = loader.select_partitions(tmp_path, years=[2025, 2026])
+    assert [p.parent.name for p in sel] == ["year=2025", "year=2026"]
+
+
+def test_select_partitions_none_returns_all(tmp_path):
+    _write_partition(tmp_path, 2024, [_row()])
+    _write_partition(tmp_path, 2025, [_row()])
+    assert len(loader.select_partitions(tmp_path)) == 2
+
+
+def test_select_partitions_unknown_year_omitted(tmp_path):
+    _write_partition(tmp_path, 2025, [_row()])
+    assert loader.select_partitions(tmp_path, years=[2099]) == []
+
+
 def test_iter_rows_orders_columns_and_maps_nulls(tmp_path):
     path = _write_partition(
         tmp_path,
@@ -116,25 +135,7 @@ def test_iter_rows_orders_columns_and_maps_nulls(tmp_path):
     assert rows[1] == (11, None, "BATTERY")  # null lat -> None, order preserved
 
 
-# --- integration test: full load round-trip (needs Postgres) ----------------
-
-
-@pytest.fixture
-def pg_conn():
-    import psycopg
-
-    from chicago_crime_mcp.store.config import StoreConfig
-
-    try:
-        conn = psycopg.connect(StoreConfig.from_env().database_url, connect_timeout=2)
-    except psycopg.OperationalError as exc:  # pragma: no cover - env dependent
-        pytest.skip(f"no Postgres reachable: {exc}")
-    conn.execute("DROP TABLE IF EXISTS incidents CASCADE")
-    conn.commit()
-    yield conn
-    conn.execute("DROP TABLE IF EXISTS incidents CASCADE")
-    conn.commit()
-    conn.close()
+# --- integration tests: need Postgres; use the dedicated test DB (see conftest) --
 
 
 @pytest.mark.integration
@@ -164,3 +165,69 @@ def test_load_full_refresh_round_trip(tmp_path, pg_conn):
     # Full refresh is idempotent: a second run replaces, not appends.
     loader.load(pg_conn, parquet_root=tmp_path)
     assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 3
+
+
+@pytest.mark.integration
+def test_upsert_updates_and_inserts(tmp_path, pg_conn):
+    # Initial state: two 2025 rows.
+    _write_partition(
+        tmp_path,
+        2025,
+        [_row(id=1, primary_type="THEFT", primary_type_canonical="THEFT"), _row(id=2)],
+    )
+    loader.load(pg_conn, parquet_root=tmp_path)
+
+    # Incremental rewrites the 2025 partition (id=1 reclassified + moved, id=3 new)
+    # and lands a brand-new current-year partition (id=4 in 2026).
+    _write_partition(
+        tmp_path,
+        2025,
+        [
+            _row(id=1, latitude=41.9, longitude=-87.7),  # default primary_type BATTERY
+            _row(id=2),
+            _row(id=3),
+        ],
+    )
+    _write_partition(tmp_path, 2026, [_row(id=4, date=datetime(2026, 1, 1, 0, 0))])
+
+    summary = loader.upsert(pg_conn, parquet_root=tmp_path)
+    assert summary == {"partitions": 2, "rows": 4}
+
+    # id=1 overwritten in place (not duplicated); id=3/4 inserted.
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 4
+    assert (
+        pg_conn.execute("SELECT primary_type FROM incidents WHERE id = 1").fetchone()[0]
+        == "BATTERY"
+    )
+    # geom is regenerated from the new coordinates.
+    lon = pg_conn.execute(
+        "SELECT ST_X(geom::geometry) FROM incidents WHERE id = 1"
+    ).fetchone()[0]
+    assert round(lon, 1) == -87.7
+    assert (
+        pg_conn.execute("SELECT count(*) FROM incidents WHERE id IN (3, 4)").fetchone()[0] == 2
+    )
+
+
+@pytest.mark.integration
+def test_upsert_years_filter_scopes_to_requested_year(tmp_path, pg_conn):
+    _write_partition(
+        tmp_path,
+        2025,
+        [_row(id=1, primary_type="THEFT", primary_type_canonical="THEFT")],
+    )
+    loader.load(pg_conn, parquet_root=tmp_path)
+
+    # Both partitions change on disk, but we only upsert 2026.
+    _write_partition(tmp_path, 2025, [_row(id=1)])  # would flip THEFT -> BATTERY
+    _write_partition(tmp_path, 2026, [_row(id=2, date=datetime(2026, 1, 1, 0, 0))])
+
+    summary = loader.upsert(pg_conn, parquet_root=tmp_path, years=[2026])
+    assert summary == {"partitions": 1, "rows": 1}
+
+    # 2026 row inserted; the 2025 change was NOT applied.
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 2
+    assert (
+        pg_conn.execute("SELECT primary_type FROM incidents WHERE id = 1").fetchone()[0]
+        == "THEFT"
+    )

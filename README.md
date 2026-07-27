@@ -95,6 +95,24 @@ docker compose ps                # both should read "Up (healthy)"
   connects with no `.env` changes; production overrides `DATABASE_URL` /
   `REDIS_URL`.
 
+Load the Parquet dataset into Postgres:
+
+```bash
+chicago-crime-load                       # full refresh (rebuild the incidents table)
+chicago-crime-load --mode upsert --years 2025 2026   # merge only changed partitions
+```
+
+### Running the tests
+
+```bash
+pytest                    # unit tests only (default; no services needed)
+pytest -m integration     # integration tests (need the storage stack up)
+```
+
+Integration tests run against a **dedicated `<db>_test` database** that is created
+on demand, so they never touch the data you've loaded into the dev database
+(override the target with `TEST_DATABASE_URL`).
+
 ### Explore the source data
 ```bash
 python scripts/download_data.py peek            # 200-row sample + field inventory
