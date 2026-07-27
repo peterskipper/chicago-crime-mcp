@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 chicago-crime-ingest = "chicago_crime_mcp.ingest.cli:main"
 chicago-crime-load = "chicago_crime_mcp.store.postgres.loader:main"
+chicago-crime-rollup = "chicago_crime_mcp.store.duckdb.rollups:main"
 
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
