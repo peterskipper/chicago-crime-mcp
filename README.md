@@ -26,6 +26,48 @@ Socrata (SODA API)
                    MCP server  ──►  LLM client (e.g. Anthropic API MCP connector)
 ```
 
+### Query routing: three tiers
+A question is served by the cheapest tier that can answer it correctly:
+
+| tier | serves | engine | measured |
+|---|---|---|---|
+| 1 | point lookup, case number, radius/spatial | Postgres/PostGIS | GiST index scan |
+| 2 | aggregate on an aligned grain (month/quarter/year × one geography) | DuckDB **materialized rollups** | ~1 ms |
+| 3 | aggregate on an arbitrary range ("last 30 days", Jan 5 – Feb 20) | DuckDB **live scan** over the same Parquet | ~8 ms |
+
+Tier 3 is the honest part: the rollups are built at **month** grain, so they
+genuinely cannot answer an arbitrary date range. Rather than pretend otherwise,
+those queries fall through to a live DuckDB scan of the same Parquet — same
+engine, same view, same answers (verified identical), just not pre-aggregated.
+The rollups are a latency and cacheability tier — they're what Redis will front
+— not a rescue for a slow query.
+
+**Rollup design** (`store/duckdb/rollups.sql`), five tables + provenance, 508k
+rows / 3.9 MB total, full rebuild in ~0.5 s over 1.69M incidents:
+
+- **Month grain, not day.** Measured: day × type × beat yields 1.37M groups from
+  1.69M rows — 81% of the row count, so no compression and no benefit.
+- **One geography per table** (`citywide`, `beat`, `district`, `community_area`,
+  `ward`). `district` gets its own table rather than riding along in
+  `rollup_beat`: beat → district is only *nearly* a functional dependency — 207
+  source rows (0.012%) place a beat in the wrong district, which would split a
+  single (month, type, beat) bucket in two and silently undercount for anyone
+  filtering on both. A dedicated district table removes that failure mode by
+  construction, and neither table infers geography from the other.
+- **Counts, never rates.** `arrest_rate` is derived at read time as
+  `arrests/incidents`; a stored rate is wrong the moment two buckets are summed.
+- **Null geography buckets are kept**, so `SUM(incidents)` equals the source row
+  count on every table — an invariant the tests assert.
+- **`geocoded` is a measure** because the geocode rate is *systematically*
+  biased, not uniform: 91.4% for offenses involving children and 92.5% for sex
+  offenses (location suppressed for victim privacy) versus 100% for homicide.
+  Spatial tools only ever see geocoded rows, so an aggregate count and a radius
+  count legitimately disagree — per-bucket `geocoded` lets the result envelope
+  say by how much, for the exact slice asked about.
+- **Refresh is always a full rebuild.** At 0.5 s there is no case for incremental
+  rollup maintenance — a deliberate contrast with the Postgres loader, where an
+  8M-row `COPY` did justify a separate upsert path.
+
 ### Why the server doesn't call Socrata live
 Live API calls mean unpredictable latency, rate limits, no cross-dataset joins,
 and no query-plan control. The interesting engineering lives in the ingestion
@@ -70,9 +112,58 @@ output:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"          # add [store] and [server] in later phases
+pip install -e ".[dev,store]"    # dev tooling + storage-layer deps ([server] lands in Phase 3)
 cp .env.example .env             # then paste your Socrata app token
 ```
+
+The `store` extra pulls the storage-layer drivers: `psycopg` (Postgres/PostGIS),
+`redis`, and `duckdb`.
+
+### Local storage stack (PostGIS + Redis)
+
+The storage layer routes across Postgres/PostGIS (point lookups + spatial
+queries) and Redis (cache-aside). `docker-compose.yml` brings both up locally:
+
+```bash
+docker compose up -d             # start PostGIS + Redis
+docker compose ps                # both should read "Up (healthy)"
+```
+
+- Ports bind to `127.0.0.1` only, so the default dev credentials (`crime:crime`,
+  and Redis' no-auth default) are not reachable off-machine.
+- On Apple Silicon the local Postgres uses `imresamu/postgis` — a multi-arch
+  rebuild of the amd64-only official PostGIS image (same PG 17 / PostGIS 3.5).
+- `StoreConfig.from_env()` defaults mirror the compose file, so a fresh checkout
+  connects with no `.env` changes; production overrides `DATABASE_URL` /
+  `REDIS_URL`.
+
+Load the Parquet dataset into Postgres:
+
+```bash
+chicago-crime-load                       # full refresh (rebuild the incidents table)
+chicago-crime-load --mode upsert --years 2025 2026   # merge only changed partitions
+```
+
+Build the DuckDB OLAP rollups from the same Parquet (no services needed — DuckDB
+is embedded; writes to `DUCKDB_PATH`, default `data/duckdb/crime.duckdb`):
+
+```bash
+chicago-crime-rollup                     # full rebuild of all five rollup tables
+```
+
+Run it after each ingest; it always rebuilds from scratch, so it is safe to
+re-run at any time.
+
+### Running the tests
+
+```bash
+pytest                    # unit tests only (default; no services needed)
+pytest -m integration     # integration tests (need the storage stack up)
+```
+
+Integration tests run against a **dedicated `<db>_test` database** that is created
+on demand, so they never touch the data you've loaded into the dev database
+(override the target with `TEST_DATABASE_URL`).
 
 ### Explore the source data
 ```bash

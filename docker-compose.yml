@@ -1,0 +1,66 @@
+# Local development substrate for the storage layer (Phase 2).
+#
+# Two engines the MCP server routes across:
+#   - postgres (PostGIS): point lookups, case-number retrieval, radius/spatial
+#     queries, and boundary containment.
+#   - redis: cache-aside for hot aggregates and neighborhood/geocode resolution.
+#
+# DuckDB is deliberately NOT a service: it is an in-process engine that reads the
+# local Parquet plus a persistent .duckdb file, so it needs no container.
+#
+# In production these map onto Railway's managed offerings (a PostGIS-extension
+# Postgres template + the Redis plugin). The app reaches both purely via the
+# DATABASE_URL / REDIS_URL env vars, so no code differs between local and prod.
+# Keep the Postgres major below in sync with the Railway template you deploy.
+
+name: chicago-crime-mcp
+
+services:
+  postgres:
+    # The official postgis/postgis image is amd64-only; imresamu/postgis is a
+    # faithful multi-arch rebuild (same PG 17 / PostGIS 3.5) so this runs native
+    # on Apple Silicon instead of under emulation. Production (Railway, amd64)
+    # can use the official postgis/postgis:17-3.5 - the DSN-driven config means
+    # no code depends on which build serves the connection. Keep PG major (17)
+    # and PostGIS (3.5) matched to the Railway template.
+    image: imresamu/postgis:17-3.5
+    container_name: chicago-crime-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-crime}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crime}
+      POSTGRES_DB: ${POSTGRES_DB:-chicago_crime}
+    ports:
+      # Bind to loopback only: the weak dev credentials must not be reachable
+      # off-machine (shared WiFi, LAN). Host tools still connect via localhost.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Gate dependents on a genuinely ready DB, not just an open port.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-crime} -d ${POSTGRES_DB:-chicago_crime}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: chicago-crime-redis
+    # Light persistence so resolved geocodes/aggregates survive a restart; a
+    # cache miss is only ever a correctness-neutral recompute.
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      # Loopback only: Redis has no auth by default, so never expose it off-host.
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:

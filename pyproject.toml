@@ -18,6 +18,8 @@ dependencies = [
 
 [project.scripts]
 chicago-crime-ingest = "chicago_crime_mcp.ingest.cli:main"
+chicago-crime-load = "chicago_crime_mcp.store.postgres.loader:main"
+chicago-crime-rollup = "chicago_crime_mcp.store.duckdb.rollups:main"
 
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
@@ -55,4 +57,9 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# Integration tests need a live Postgres/Redis; exclude them from the default
+# (unit) run. Run them explicitly with `pytest -m integration`.
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: requires a live Postgres/Redis (excluded by default)",
+]
