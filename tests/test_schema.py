@@ -165,3 +165,47 @@ def test_refresh_snapshot_reports_diff(tmp_path):
     ]
     diff = schema.refresh_iucr_snapshot(_iucr_client(v2), path=path)
     assert diff == {"added": ["0130"], "removed": [], "relabeled": ["0281"]}
+
+
+def test_refresh_preserves_curated_columns(tmp_path):
+    """A refresh mirrors upstream but must not wipe our own analytic columns.
+
+    `stable_category` is a hand-made judgment that lives in the same file as the
+    upstream snapshot; overwriting the file wholesale would silently discard it.
+    """
+    path = tmp_path / "iucr_codes.csv"
+    upstream = [
+        {"iucr": "0610", "primary_description": "BURGLARY"},
+        {"iucr": "0760", "primary_description": "BURGLARY"},
+    ]
+    schema.refresh_iucr_snapshot(_iucr_client(upstream), path=path)
+
+    curated = pd.read_csv(path, dtype=str)
+    assert "stable_category" in curated.columns  # created even on a first write
+    curated.loc[curated["iucr"] == "0760", "stable_category"] = "THEFT"
+    curated.to_csv(path, index=False)
+
+    schema.refresh_iucr_snapshot(_iucr_client(upstream), path=path)
+
+    after = pd.read_csv(path, dtype=str).set_index("iucr")["stable_category"]
+    assert after["0760"] == "THEFT"
+    assert pd.isna(after["0610"])
+
+
+def test_committed_snapshot_carries_the_curated_column():
+    """The shipped snapshot has the column, curated sparsely and on purpose."""
+    df = pd.read_csv(schema.IUCR_REFERENCE_PATH, dtype=str)
+    curated = dict(
+        zip(
+            df.loc[df["stable_category"].notna(), "iucr"],
+            df.loc[df["stable_category"].notna(), "stable_category"],
+            strict=True,
+        )
+    )
+    # `0760` BURGLARY FROM MOTOR VEHICLE: minted 2021, ramped 2024, and moved car
+    # break-ins from THEFT into BURGLARY. Mapping it back makes both series
+    # comparable across its introduction.
+    assert curated["0760"] == "THEFT"
+    # Curation is deliberately tiny -- every row needs evidence of measured drift,
+    # and a full IUCR taxonomy is a research project, not this feature.
+    assert len(curated) < 10, f"unexpectedly broad curation: {curated}"
