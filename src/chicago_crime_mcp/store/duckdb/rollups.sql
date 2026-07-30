@@ -6,14 +6,14 @@
 -- this file (see rollups.py); no path is hardcoded here.
 --
 -- GRAIN: MONTH. Daily grain was measured and rejected: day x type x beat yields
--- 1.37M groups from 1.69M source rows (81% of the row count), i.e. no
+-- 2.33M groups from 2.88M source rows (81% of the row count), i.e. no
 -- compression and no benefit. Month buckets roll up cleanly to quarter and year
 -- by summing. Arbitrary date ranges ("last 30 days") deliberately do NOT route
 -- here -- they fall through to a live DuckDB scan over the same Parquet.
 --
 -- ONE GEOGRAPHY PER TABLE. `district` gets its own table rather than riding
 -- along in rollup_beat. beat -> district is only *nearly* a functional
--- dependency: 207 source rows (0.012%) put a beat in the wrong district, which
+-- dependency: 248 source rows (0.009%) put a beat in the wrong district, which
 -- would split a single (month, type, beat) bucket into two rows and make beat
 -- totals silently wrong for anyone who filtered on both columns. A dedicated
 -- district table is ~39k rows and removes that failure mode by construction.
@@ -24,7 +24,7 @@
 -- summed -- averaging rates across buckets of different sizes does not give the
 -- combined rate.
 --
--- NULL GEOGRAPHY BUCKETS ARE KEPT. 150 rows have a null community_area and 36 a
+-- NULL GEOGRAPHY BUCKETS ARE KEPT. 221 rows have a null community_area and 56 a
 -- null ward. Dropping them would silently lose incidents; keeping them preserves
 -- the invariant SUM(incidents) == source row count, which the tests assert on
 -- every table.

@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS incidents (
 );
 
 -- Indexes backing the headline tools. Create these AFTER the bulk COPY in the
--- loader, not before -- maintaining them per-row during an 8M-row load is slow.
+-- loader, not before -- maintaining them per-row during a 2.9M-row load is slow.
 CREATE INDEX IF NOT EXISTS incidents_geom_gix ON incidents USING GIST (geom);              -- nearby_incidents (radius)
 CREATE INDEX IF NOT EXISTS incidents_date_idx ON incidents (date);                         -- time filters / ranges
 CREATE INDEX IF NOT EXISTS incidents_ptc_idx  ON incidents (primary_type_canonical);       -- filter/group by offense
@@ -72,6 +72,6 @@ CREATE INDEX IF NOT EXISTS incidents_case_idx ON incidents (case_number);       
 
 -- Deferred (add EXPLAIN-driven, once the tools that filter on them exist):
 --   beat, district, community_area, ward. These are low-cardinality (e.g.
---   community_area has ~77 values over 8M rows), so a bare single-column index
+--   community_area has ~77 values over 2.9M rows), so a bare single-column index
 --   is often not selective enough to beat a seq scan; when added they likely
 --   want to be composites with `date` (e.g. (community_area, date)).

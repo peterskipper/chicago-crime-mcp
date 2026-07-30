@@ -12,12 +12,12 @@ cheapest first:
 Tier 3 matters: month grain genuinely cannot answer an arbitrary date range, and
 a documented fallback beats pretending otherwise. The rollups are a latency and
 cacheability tier (they are what Redis will front), not a rescue for a slow
-query -- a live scan of 1.7M rows already answers in ~40ms.
+query -- a live scan of 2.88M rows already answers in ~24ms.
 
 **Refresh is always a full rebuild.** ``CREATE OR REPLACE TABLE`` over the whole
-dataset measured 0.04s at 1.7M rows, so incremental rollup maintenance would add
+dataset measured 0.5s at 2.88M rows, so incremental rollup maintenance would add
 real complexity to save milliseconds. This is a deliberate contrast with the
-Postgres loader, where an 8M-row ``COPY`` did justify a separate upsert path.
+Postgres loader, where a 2.9M-row ``COPY`` did justify a separate upsert path.
 
 The grain, measure and null-handling decisions live in ``rollups.sql`` next to
 the SQL they govern; that file is the single source of truth for the DDL.
