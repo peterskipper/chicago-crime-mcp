@@ -220,6 +220,153 @@ def test_no_rate_columns_are_stored(built):
         assert not any("rate" in c for c in columns), f"{table} stores a rate"
 
 
+# --- taxonomy: stable_category + code_coverage ------------------------------
+
+
+@pytest.fixture
+def drifted(tmp_path):
+    """Build rollups over rows that exercise the real IUCR taxonomy drift.
+
+    Uses genuine codes, not invented ones, because the join is against the
+    committed reference snapshot: ``0610`` (BURGLARY / FORCIBLE ENTRY, no curated
+    override) and ``0760`` (BURGLARY FROM MOTOR VEHICLE, curated to THEFT because
+    it was minted mid-dataset and moved car break-ins out of THEFT). One row
+    carries an IUCR absent from the reference entirely.
+    """
+    _write_partition(
+        tmp_path / "parquet",
+        2019,
+        [
+            _row(id=1, date=datetime(2019, 5, 1), iucr="0610",
+                 primary_type_canonical="BURGLARY", community_area=22),
+        ],
+    )
+    _write_partition(
+        tmp_path / "parquet",
+        2025,
+        [
+            _row(id=2, date=datetime(2025, 5, 1), iucr="0610",
+                 primary_type_canonical="BURGLARY", community_area=22),
+            _row(id=3, date=datetime(2025, 5, 2), iucr="0760",
+                 primary_type_canonical="BURGLARY", community_area=22),
+            _row(id=4, date=datetime(2025, 6, 3), iucr="0760",
+                 primary_type_canonical="BURGLARY", community_area=22),
+            # An IUCR the snapshot has never heard of: the LEFT JOIN must keep it.
+            _row(id=5, date=datetime(2025, 6, 4), iucr="9999",
+                 primary_type_canonical="OTHER OFFENSE", community_area=22),
+        ],
+    )
+    conn = rollups.connect(
+        duckdb_path=tmp_path / "db" / "crime.duckdb",
+        parquet_root=tmp_path / "parquet",
+    )
+    rollups.build(conn)
+    yield conn
+    conn.close()
+
+
+def test_stable_category_defaults_to_the_canonical_type(drifted):
+    """A code with no curated override keeps its canonical type in both columns."""
+    rows = drifted.execute(
+        "SELECT DISTINCT primary_type_canonical, stable_category FROM rollup_citywide "
+        "WHERE stable_category = 'BURGLARY'"
+    ).fetchall()
+    assert rows == [("BURGLARY", "BURGLARY")]
+
+
+def test_unknown_iucr_is_not_dropped_by_the_reference_join(drifted):
+    """The LEFT JOIN plus coalesce: an unmapped code falls back, never disappears."""
+    row = drifted.execute(
+        "SELECT primary_type_canonical, stable_category, incidents FROM rollup_citywide "
+        "WHERE primary_type_canonical = 'OTHER OFFENSE'"
+    ).fetchall()
+    assert row == [("OTHER OFFENSE", "OTHER OFFENSE", 1)]
+
+
+def test_curated_code_splits_the_two_type_dimensions(drifted):
+    """`0760` is BURGLARY to the city and THEFT for comparison across time."""
+    rows = drifted.execute(
+        "SELECT primary_type_canonical, stable_category, sum(incidents) FROM rollup_citywide "
+        "WHERE stable_category = 'THEFT' GROUP BY 1, 2"
+    ).fetchall()
+    assert rows == [("BURGLARY", "THEFT", 2)]
+
+
+def test_both_taxonomies_are_answerable_from_every_table(drifted):
+    """The point of carrying both dimensions: source and comparable, one build.
+
+    Source counts 4 burglaries in Logan Square (community area 22); comparable
+    counts 2, because the two `0760` rows are car break-ins that lived under
+    THEFT before the code existed.
+    """
+    for table in rollups.ROLLUP_TABLES:
+        source, comparable = drifted.execute(
+            f"SELECT sum(incidents) FILTER (WHERE primary_type_canonical = 'BURGLARY'), "
+            f"       sum(incidents) FILTER (WHERE stable_category = 'BURGLARY') "
+            f"FROM {table}"
+        ).fetchone()
+        assert (source, comparable) == (4, 2), table
+
+
+def test_adding_the_dimension_does_not_change_totals(drifted):
+    """Summing over stable_category must reproduce the pre-taxonomy counts."""
+    for table in rollups.ROLLUP_TABLES:
+        total = drifted.execute(f"SELECT sum(incidents) FROM {table}").fetchone()[0]
+        assert total == 5, table
+
+
+def test_code_coverage_reports_each_code_lifespan(drifted):
+    """First/last month per code -- what the tool layer warns from."""
+    rows = drifted.execute(
+        "SELECT iucr, primary_type_canonical, stable_category, first_month, last_month, "
+        "incidents FROM code_coverage ORDER BY iucr"
+    ).fetchall()
+    assert rows == [
+        # spans the whole fixture window: no warning
+        ("0610", "BURGLARY", "BURGLARY", datetime(2019, 5, 1), datetime(2025, 5, 1), 2),
+        # introduced mid-window: any span starting before 2025-05 is not comparable
+        ("0760", "BURGLARY", "THEFT", datetime(2025, 5, 1), datetime(2025, 6, 1), 2),
+        ("9999", "OTHER OFFENSE", "OTHER OFFENSE", datetime(2025, 6, 1), datetime(2025, 6, 1), 1),
+    ]
+
+
+def test_code_coverage_accounts_for_every_incident(drifted):
+    """No code is missing, so a share-of-rows warning can be computed from it."""
+    source_rows = drifted.execute("SELECT source_rows FROM rollup_meta").fetchone()[0]
+    covered = drifted.execute("SELECT sum(incidents) FROM code_coverage").fetchone()[0]
+    assert covered == source_rows
+
+
+# --- the reference table ----------------------------------------------------
+
+
+def test_reference_table_preserves_zero_padded_codes(built):
+    """IUCR codes are identifiers: `0110` must not arrive as the integer 110."""
+    codes = built.execute(
+        "SELECT iucr FROM iucr_reference WHERE iucr IN ('0110', '0760')"
+    ).fetchall()
+    assert sorted(c[0] for c in codes) == ["0110", "0760"]
+
+
+def test_reference_table_reads_blank_curation_as_null(built):
+    """Blank `stable_category` must be NULL so the coalesce falls through."""
+    assert built.execute(
+        "SELECT stable_category FROM iucr_reference WHERE iucr = '0110'"
+    ).fetchone()[0] is None
+    assert built.execute(
+        "SELECT stable_category FROM iucr_reference WHERE iucr = '0760'"
+    ).fetchone()[0] == "THEFT"
+
+
+def test_ensure_iucr_reference_rejects_a_missing_snapshot(tmp_path):
+    import duckdb as duckdb_pkg
+
+    conn = duckdb_pkg.connect()
+    with pytest.raises(FileNotFoundError):
+        rollups.ensure_iucr_reference(conn, tmp_path / "absent.csv")
+    conn.close()
+
+
 # --- meta + rebuild ---------------------------------------------------------
 
 
@@ -241,7 +388,8 @@ def test_build_summary_reports_row_counts(tmp_path):
     assert summary["source_rows"] == 2
     assert summary["rollup_citywide"] == 1  # same month + type
     assert summary["rollup_beat"] == 2  # two beats
-    assert set(summary) == set(rollups.ROLLUP_TABLES) | {"source_rows"}
+    assert summary[rollups.COVERAGE_TABLE] == 1  # both rows share an IUCR
+    assert set(summary) == set(rollups.ROLLUP_TABLES) | {rollups.COVERAGE_TABLE, "source_rows"}
 
 
 def test_rebuild_replaces_rather_than_appends(tmp_path):

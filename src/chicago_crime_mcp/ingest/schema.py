@@ -25,13 +25,18 @@ from pathlib import Path
 import pandas as pd
 
 from chicago_crime_mcp.ingest.socrata import SodaClient
+from chicago_crime_mcp.reference import IUCR_REFERENCE_PATH
 
 CRIME_DATASET_ID = "ijzp-q8t2"
 IUCR_DATASET_ID = "c7ck-438e"
 
-# Pinned snapshot of the IUCR reference table, committed for reproducible,
-# offline canonicalization. Refresh with ``refresh_iucr_snapshot``.
-IUCR_REFERENCE_PATH = Path(__file__).parent / "data" / "iucr_codes.csv"
+# Re-exported for callers that already import it from here; the file itself lives
+# in the shared `reference` package because the store layer reads it too.
+__all__ = ["IUCR_REFERENCE_PATH"]
+
+# Our column, not the city's: `refresh_iucr_snapshot` must carry it across a
+# refresh instead of overwriting it with the upstream fetch. See reference/.
+CURATED_COLUMNS = ("stable_category",)
 
 # Explicit column list for the incident pull. Excludes the nested ``location``
 # object (redundant with latitude/longitude) and keeps payloads small/stable.
@@ -121,7 +126,12 @@ def refresh_iucr_snapshot(
     """Refresh the pinned IUCR snapshot from Socrata and report what changed.
 
     Fetches the current reference table, diffs it against the existing snapshot
-    (if any), then overwrites the snapshot on disk.
+    (if any), then rewrites the snapshot on disk. The upstream columns are
+    replaced wholesale; :data:`CURATED_COLUMNS` are joined back on from the old
+    file so a refresh cannot silently discard hand-curated analytic judgments.
+
+    A curated code that disappears upstream loses its curation - it is reported
+    in ``removed``, which is the signal to re-curate.
 
     Args:
         client: An open :class:`SodaClient`.
@@ -138,15 +148,26 @@ def refresh_iucr_snapshot(
     added: list[str] = []
     removed: list[str] = []
     relabeled: list[str] = []
+    curated = pd.DataFrame(columns=["iucr", *CURATED_COLUMNS])
     if path.exists():
         old = pd.read_csv(path, dtype=str)
-        old_map = dict(zip(old["iucr"].str.zfill(4), old["primary_description"], strict=False))
+        old["iucr"] = old["iucr"].str.zfill(4)
+        old_map = dict(zip(old["iucr"], old["primary_description"], strict=False))
         new_map = dict(zip(new["iucr"], new["primary_description"], strict=False))
         added = sorted(set(new_map) - set(old_map))
         removed = sorted(set(old_map) - set(new_map))
         relabeled = sorted(
             c for c in set(old_map) & set(new_map) if old_map[c] != new_map[c]
         )
+        present = [c for c in CURATED_COLUMNS if c in old.columns]
+        if present:
+            curated = old[["iucr", *present]]
+
+    new = new.merge(curated, on="iucr", how="left")
+    for column in CURATED_COLUMNS:
+        if column not in new.columns:
+            new[column] = pd.NA
+
     path.parent.mkdir(parents=True, exist_ok=True)
     new.to_csv(path, index=False)
     return {"added": added, "removed": removed, "relabeled": relabeled}

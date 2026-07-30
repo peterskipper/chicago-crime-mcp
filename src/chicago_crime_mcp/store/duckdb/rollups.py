@@ -37,6 +37,7 @@ from pathlib import Path
 
 import duckdb
 
+from chicago_crime_mcp.reference import IUCR_REFERENCE_PATH
 from chicago_crime_mcp.store.config import DEFAULT_DUCKDB_PATH, DEFAULT_PARQUET_ROOT
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,10 @@ ROLLUPS_PATH = Path(__file__).parent / "rollups.sql"
 # scans. Named to match the Postgres table so a query means the same thing in
 # either engine.
 SOURCE_VIEW = "incidents"
+
+# The committed IUCR snapshot, loaded as a table so the rollups can tag each
+# incident with its stable_category.
+REFERENCE_TABLE = "iucr_reference"
 
 # Rollup tables built by rollups.sql, finest geography first. Kept here so the
 # builder can report per-table row counts and the tests can assert the
@@ -59,6 +64,12 @@ ROLLUP_TABLES = (
     "rollup_community_area",
     "rollup_ward",
 )
+
+# Not a rollup: one row per IUCR code with its observed lifespan. Kept out of
+# ROLLUP_TABLES because nothing routes an aggregate query to it -- it is metadata
+# the tool layer consults to warn that a requested span crosses a code's
+# introduction or retirement.
+COVERAGE_TABLE = "code_coverage"
 
 
 def ensure_parquet_view(
@@ -99,6 +110,44 @@ def ensure_parquet_view(
     )
 
 
+def ensure_iucr_reference(
+    conn: duckdb.DuckDBPyConnection,
+    reference_path: Path = IUCR_REFERENCE_PATH,
+) -> None:
+    """(Re)load the committed IUCR snapshot into the ``iucr_reference`` table.
+
+    A table, not a view, because the CSV is small (~435 rows) and a view would
+    re-read and re-parse the file on every query. Reloaded on every non-read-only
+    connect for the same reason the Parquet view is recreated: the file is
+    git-tracked and can change under the database between runs.
+
+    Every column is read as text (``all_varchar``): IUCR codes are zero-padded
+    identifiers like ``0110`` and include non-numeric ones like ``142A``, so type
+    inference would mangle them. ``stable_category`` is left blank for codes with
+    no curated override, and ``nullstr`` turns those blanks into NULL so the
+    coalesce in ``incidents_tagged`` falls through to the canonical type.
+
+    Args:
+        conn: An open DuckDB connection.
+        reference_path: Path to the IUCR snapshot CSV.
+
+    Raises:
+        FileNotFoundError: If the snapshot is missing.
+    """
+    path = reference_path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"IUCR reference snapshot not found at {path}")
+
+    # Inlined for the same reason as the Parquet path: DuckDB cannot prepare DDL.
+    # The value comes from packaged data, never from user input.
+    literal = str(path).replace("'", "''")
+    conn.execute(
+        f"CREATE OR REPLACE TABLE {REFERENCE_TABLE} AS "
+        "SELECT lpad(iucr, 4, '0') AS iucr, primary_description, stable_category "
+        f"FROM read_csv('{literal}', all_varchar=true, nullstr='')"
+    )
+
+
 def connect(
     duckdb_path: Path = DEFAULT_DUCKDB_PATH,
     parquet_root: Path = DEFAULT_PARQUET_ROOT,
@@ -112,9 +161,10 @@ def connect(
     Args:
         duckdb_path: Path to the persistent DuckDB database file.
         parquet_root: Root of the Hive-partitioned Parquet dataset.
-        read_only: Open read-only. Query paths should pass ``True``; the view is
-            then assumed to already exist (a read-only connection cannot create
-            it), which holds for any database a build has run against.
+        read_only: Open read-only. Query paths should pass ``True``; the view and
+            the reference table are then assumed to already exist (a read-only
+            connection cannot create them), which holds for any database a build
+            has run against.
 
     Returns:
         An open connection.
@@ -124,6 +174,7 @@ def connect(
     conn = duckdb.connect(str(duckdb_path), read_only=read_only)
     if not read_only:
         ensure_parquet_view(conn, parquet_root)
+        ensure_iucr_reference(conn)
     return conn
 
 
@@ -138,8 +189,8 @@ def build(conn: duckdb.DuckDBPyConnection) -> dict:
             :func:`connect`).
 
     Returns:
-        A summary dict mapping each rollup table name to its row count, plus
-        ``source_rows`` (the number of incidents rolled up).
+        A summary dict mapping each rollup table name (plus ``code_coverage``) to
+        its row count, plus ``source_rows`` (the number of incidents rolled up).
     """
     conn.execute("BEGIN TRANSACTION")
     try:
@@ -149,13 +200,14 @@ def build(conn: duckdb.DuckDBPyConnection) -> dict:
         raise
     conn.execute("COMMIT")
 
+    tables = (*ROLLUP_TABLES, COVERAGE_TABLE)
     summary = {
         table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        for table in ROLLUP_TABLES
+        for table in tables
     }
     summary["source_rows"] = conn.execute("SELECT source_rows FROM rollup_meta").fetchone()[0]
 
-    for table in ROLLUP_TABLES:
+    for table in tables:
         log.info("built %s: %d rows", table, summary[table])
     return summary
 

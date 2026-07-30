@@ -43,8 +43,8 @@ engine, same view, same answers (verified identical), just not pre-aggregated.
 The rollups are a latency and cacheability tier — they're what Redis will front
 — not a rescue for a slow query.
 
-**Rollup design** (`store/duckdb/rollups.sql`), five tables + provenance, 849k
-rows / 10 MB total, full rebuild in ~0.5 s over 2.88M incidents:
+**Rollup design** (`store/duckdb/rollups.sql`), five tables + provenance + code
+coverage, 854k rows / 6.8 MB total, full rebuild in ~0.7 s over 2.88M incidents:
 
 - **Month grain, not day.** Measured: day × type × beat yields 2.33M groups from
   2.88M rows — 81% of the row count, so no compression and no benefit.
@@ -55,6 +55,11 @@ rows / 10 MB total, full rebuild in ~0.5 s over 2.88M incidents:
   (month, type, beat) buckets in two and silently undercounting for anyone
   filtering on both. A dedicated district table removes that failure mode by
   construction, and neither table infers geography from the other.
+- **Two type dimensions, never one.** Every table carries both
+  `primary_type_canonical` (what the city called it) and `stable_category` (what
+  it means for comparison across time), so one build answers both taxonomy
+  modes and neither is unrecoverable. Costs under 1% more rows on every table.
+  See [On comparing crime over time](#on-comparing-crime-over-time).
 - **Counts, never rates.** `arrest_rate` is derived at read time as
   `arrests/incidents`; a stored rate is wrong the moment two buckets are summed.
 - **Null geography buckets are kept**, so `SUM(incidents)` equals the source row
@@ -186,6 +191,58 @@ returning normalized counts is the same failure as silently truncating results:
 the model cannot reason about a transformation it was not told about. An agent
 that reports a 40% drop because last month has not finished loading is precisely
 the failure this architecture exists to prevent.
+
+#### How taxonomy drift is actually handled
+
+Two mechanisms, deliberately split by how much human judgment each needs.
+
+**`code_coverage` — derived, no curation.** The rollup build derives every IUCR
+code's first and last observed month straight from the data
+(`store/duckdb/rollups.sql`). The tool layer compares a requested span against
+those bounds and warns when it crosses a code's introduction or retirement,
+quantified as a share of rows. Nobody has to have anticipated the code, so this
+covers the ones CPD mints after this was written. It fires under **both**
+taxonomy modes — `comparable` only fixes the drift someone actually curated.
+
+**`stable_category` — curated, and tiny.** A column in
+`reference/iucr_codes.csv`, blank for all but the codes with measured drift, and
+carried as an extra dimension on every rollup table beside
+`primary_type_canonical`. Both are stored, so the same table answers
+`taxonomy: "source"` (what the city called it) and `taxonomy: "comparable"`
+(what it means across time) — the mode is a tool parameter defaulting to
+`source`, and the envelope always names which was applied.
+
+The audit that produced the curation, over all 2.88M rows — every code whose
+lifespan is bounded inside the 2015–2026 window with ≥300 rows:
+
+| code | offense | observed | rows | decision |
+|---|---|---|---|---|
+| `0760` | burglary from motor vehicle | 2021-11 → | 8,918 | **→ `THEFT`** |
+| `0710` | theft from motor vehicle | 2015-10 → | 11,418 | no remap needed |
+| `3970` | extortion | → 2024-01 | 681 | coverage flag only |
+| `3400` | looting | 2020-03 → 2020-08 | 397 | coverage flag only |
+| `1187` | state benefits fraud | 2019-01 → | 486 | coverage flag only |
+
+`0760` is the only one that crosses a primary-type boundary, and so the only
+curated row. Both vehicle codes ramp in 2024 (`0710` 4 → 2,285 rows, `0760`
+2 → 775), drawing from generic theft codes `0810`/`0820`, which fall by a
+comparable amount. `0710` stayed inside THEFT, where those incidents already
+lived, so it needs nothing. `0760` moved them into BURGLARY — a category that
+until then meant entering a building. Mapping it back to THEFT repairs both
+series: citywide burglary reads 8,434 → 9,741 in 2024 → 2025 under `source`, but
+7,659 → 6,213 under `comparable`. Same data, opposite direction, and the second
+one is the answer to the question the user asked.
+
+The three "coverage flag only" codes churn *within* their own primary type
+(extortion folded into `3960` intimidation; the category total never moves), so
+a remap would be a no-op. `3400` is the boundary case that stays uncurated on
+purpose: the 2020 looting spike is a real event, and inventing a destination for
+it would be normalizing away signal rather than artifact.
+
+Label drift is a separate, already-solved problem: 6,581 rows say
+`CRIM SEXUAL ASSAULT` where later rows say `CRIMINAL SEXUAL ASSAULT` for the
+same IUCR code. `primary_type_canonical` collapses those at ingest by looking the
+label up from the code, so no analytic judgment is involved.
 
 ## Setup
 
