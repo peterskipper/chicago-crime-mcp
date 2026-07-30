@@ -7,7 +7,7 @@ SodaClient and the ingest routines monkeypatched, so nothing hits the network.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 
 import pytest
 
@@ -37,8 +37,20 @@ def _no_client_or_dotenv(monkeypatch):
 def test_backfill_defaults_to_working_window():
     args = cli.build_parser().parse_args(["backfill"])
     assert (args.command, args.start_year, args.end_year, args.force) == (
-        "backfill", 2020, 2025, False,
+        "backfill", cli.DEFAULT_START_YEAR, cli.DEFAULT_END_YEAR, False,
     )
+
+
+def test_backfill_end_year_tracks_the_calendar():
+    """The default end year must follow the clock, not a pinned literal.
+
+    Regression guard: a hardcoded end year silently stops managing the current
+    year when the calendar rolls over, and `incremental` only refreshes years
+    that already have a partition -- so the gap goes unnoticed until someone
+    asks for this year's data and gets nothing.
+    """
+    assert cli.DEFAULT_END_YEAR == date.today().year
+    assert cli.DEFAULT_START_YEAR < cli.DEFAULT_END_YEAR
 
 
 def test_backfill_accepts_overrides():

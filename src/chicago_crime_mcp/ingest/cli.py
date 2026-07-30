@@ -1,8 +1,8 @@
 """Command-line entry point for crime data ingestion.
 
 Examples:
-    # Backfill the working window (defaults shown)
-    python -m chicago_crime_mcp.ingest backfill --start-year 2020 --end-year 2025
+    # Backfill the working window (2016 through the current year by default)
+    python -m chicago_crime_mcp.ingest backfill
 
     # Re-pull a year even if its partition looks complete
     python -m chicago_crime_mcp.ingest backfill --start-year 2015 --end-year 2015 --force
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 
@@ -27,8 +27,17 @@ from chicago_crime_mcp.ingest.socrata import SodaClient
 
 log = logging.getLogger(__name__)
 
-DEFAULT_START_YEAR = 2020
-DEFAULT_END_YEAR = 2025
+# The working window is contiguous 2015 -> current year. It starts at 2015 rather
+# than the dataset's 2001 because a decade-plus exercises every query pattern
+# without tripling storage; there is no data-quality cliff at 2015 (see the
+# coverage notes in the README).
+DEFAULT_START_YEAR = 2015
+
+# Deliberately derived, not hardcoded: a pinned end year silently stops managing
+# the current year the moment the calendar rolls over, which is how the 2026
+# partition came to be missing. `incremental` only updates years that already have
+# a partition, so the gap persists until a backfill creates one.
+DEFAULT_END_YEAR = date.today().year
 
 
 def build_parser() -> argparse.ArgumentParser:

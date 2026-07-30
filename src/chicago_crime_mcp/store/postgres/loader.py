@@ -3,7 +3,7 @@
 The loader rebuilds the ``incidents`` table from the Hive-partitioned Parquet:
 it applies the schema, truncates, streams every partition in via ``COPY``, then
 (re)builds the indexes. Indexes are dropped before the ``COPY`` and recreated
-after - maintaining them per-row across an ~8M-row load is far slower than
+after - maintaining them per-row across a ~2.9M-row load is far slower than
 building each once at the end.
 
 Two entry points share the Parquet-reading helpers:
