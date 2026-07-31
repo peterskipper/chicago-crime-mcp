@@ -164,6 +164,11 @@ FROM incidents;
 -- carrying both type columns lets the tool go from a category the user asked
 -- about to the codes that constitute it. The null-IUCR bucket is kept, so
 -- SUM(incidents) here still equals the source row count.
+--
+-- Bounds only. The *weight* behind a bound -- how many rows in the requested
+-- span actually come from a code that enters or leaves mid-span -- comes from
+-- rollup_code_month below; this table's `incidents` is a lifetime count and
+-- must not be used as that share.
 CREATE OR REPLACE TABLE code_coverage AS
 SELECT
     iucr,
@@ -176,3 +181,41 @@ SELECT
 FROM incidents_tagged
 GROUP BY iucr
 ORDER BY iucr;
+
+-- The weights behind code_coverage's bounds: incidents per IUCR per month, so
+-- the tool layer can say what *share* of a requested span's rows come from
+-- codes that do not cover the whole span.
+--
+-- WHY A TABLE AND NOT A SCAN. The coverage warning has to fire on every
+-- aggregate call, and it has to be quantified -- naming a drifting code without
+-- saying whether it moved 0.1% or 40% of the rows tells the model nothing it
+-- can act on. Computing that share by scanning `incidents_tagged` per call
+-- measures 37ms on a full-span query, which would swamp the 0.67ms rollup it is
+-- meant to annotate and make the materialized tier pointless. Materialized, the
+-- same warning costs 1.5ms and 33,510 rows.
+--
+-- It also works: run against the real dataset with no curation input, the top
+-- codes it surfaces over the full span are exactly the ones the manual audit in
+-- the README found -- 0760 burglary-from-MV, 3970 extortion, 1187 state
+-- benefits fraud, 3400 looting.
+--
+-- CITYWIDE, NO GEOGRAPHY. Adding one would multiply this table by up to 275
+-- (beats) to answer a question that is not geographic: taxonomy drift is a
+-- property of how the city codes offenses, not of where they happen. The tool
+-- layer reports the share as citywide and says so; a per-neighborhood share
+-- would be a different, much more expensive claim.
+--
+-- Both type columns ride along so the share can be scoped to whatever the
+-- caller filtered on, under either taxonomy mode. The null-IUCR bucket is kept
+-- here too, so SUM(incidents) still equals the source row count -- the same
+-- invariant every other table in this file holds.
+CREATE OR REPLACE TABLE rollup_code_month AS
+SELECT
+    date_trunc('month', date) AS month,
+    iucr,
+    primary_type_canonical,
+    stable_category,
+    count(*)                  AS incidents
+FROM incidents_tagged
+GROUP BY ALL
+ORDER BY month, iucr;

@@ -124,10 +124,15 @@ def test_view_is_rebuilt_against_a_new_parquet_root(tmp_path):
 
 
 def test_every_table_counts_every_incident_exactly_once(built):
-    """SUM(incidents) == source rows on every table -- nothing dropped, nothing double-counted."""
+    """SUM(incidents) == source rows on every table -- nothing dropped, nothing double-counted.
+
+    Includes rollup_code_month: it is not a geography rollup, but it is the
+    denominator the coverage share is measured against, so a row it drops would
+    silently overstate how much of a span drifting codes account for.
+    """
     source_rows = built.execute("SELECT source_rows FROM rollup_meta").fetchone()[0]
     assert source_rows == 5
-    for table in rollups.ROLLUP_TABLES:
+    for table in (*rollups.ROLLUP_TABLES, rollups.CODE_MONTH_TABLE):
         total = built.execute(f"SELECT sum(incidents) FROM {table}").fetchone()[0]
         assert total == source_rows, f"{table} lost or duplicated incidents"
 
@@ -389,7 +394,12 @@ def test_build_summary_reports_row_counts(tmp_path):
     assert summary["rollup_citywide"] == 1  # same month + type
     assert summary["rollup_beat"] == 2  # two beats
     assert summary[rollups.COVERAGE_TABLE] == 1  # both rows share an IUCR
-    assert set(summary) == set(rollups.ROLLUP_TABLES) | {rollups.COVERAGE_TABLE, "source_rows"}
+    assert summary[rollups.CODE_MONTH_TABLE] == 1  # same IUCR, same month
+    assert set(summary) == set(rollups.ROLLUP_TABLES) | {
+        rollups.COVERAGE_TABLE,
+        rollups.CODE_MONTH_TABLE,
+        "source_rows",
+    }
 
 
 def test_rebuild_replaces_rather_than_appends(tmp_path):
