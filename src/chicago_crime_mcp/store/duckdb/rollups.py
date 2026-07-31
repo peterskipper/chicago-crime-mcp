@@ -49,6 +49,12 @@ ROLLUPS_PATH = Path(__file__).parent / "rollups.sql"
 # either engine.
 SOURCE_VIEW = "incidents"
 
+# SOURCE_VIEW left-joined to the IUCR reference, adding `stable_category`.
+# Created by rollups.sql and persisted in the database file, so a read-only
+# connection can query it: this is the surface tier-3 live scans read, chosen
+# over SOURCE_VIEW so a scan and a rollup expose the same two type dimensions.
+TAGGED_VIEW = "incidents_tagged"
+
 # The committed IUCR snapshot, loaded as a table so the rollups can tag each
 # incident with its stable_category.
 REFERENCE_TABLE = "iucr_reference"
@@ -65,11 +71,14 @@ ROLLUP_TABLES = (
     "rollup_ward",
 )
 
-# Not a rollup: one row per IUCR code with its observed lifespan. Kept out of
-# ROLLUP_TABLES because nothing routes an aggregate query to it -- it is metadata
-# the tool layer consults to warn that a requested span crosses a code's
-# introduction or retirement.
+# The two taxonomy-drift tables. Kept out of ROLLUP_TABLES because the router
+# never picks between them and an aggregate query: they are metadata the tool
+# layer consults to warn that a requested span crosses a code's introduction or
+# retirement. COVERAGE_TABLE supplies the bounds (one row per IUCR),
+# CODE_MONTH_TABLE the weights (incidents per IUCR per month) that turn a bound
+# into a share of the rows actually in the span.
 COVERAGE_TABLE = "code_coverage"
+CODE_MONTH_TABLE = "rollup_code_month"
 
 
 def ensure_parquet_view(
@@ -189,8 +198,9 @@ def build(conn: duckdb.DuckDBPyConnection) -> dict:
             :func:`connect`).
 
     Returns:
-        A summary dict mapping each rollup table name (plus ``code_coverage``) to
-        its row count, plus ``source_rows`` (the number of incidents rolled up).
+        A summary dict mapping each rollup table name (plus the two
+        taxonomy-drift tables) to its row count, plus ``source_rows`` (the
+        number of incidents rolled up).
     """
     conn.execute("BEGIN TRANSACTION")
     try:
@@ -200,7 +210,7 @@ def build(conn: duckdb.DuckDBPyConnection) -> dict:
         raise
     conn.execute("COMMIT")
 
-    tables = (*ROLLUP_TABLES, COVERAGE_TABLE)
+    tables = (*ROLLUP_TABLES, CODE_MONTH_TABLE, COVERAGE_TABLE)
     summary = {
         table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         for table in tables
