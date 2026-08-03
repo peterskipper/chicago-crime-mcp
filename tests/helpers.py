@@ -52,6 +52,22 @@ def row(**overrides) -> dict:
     canonical type). So a test that overrides only the canonical type gets a
     consistent row, and one exercising the curated remap sets both explicitly.
 
+    .. warning::
+       **Every geography default here is a single constant** -- the same beat,
+       district, ward and community area on every row. A fixture that does not
+       override them puts all its rows in one place, so a test filtering on a
+       geography has nothing to exclude: it passes identically whether the
+       predicate is applied or dropped. This has already produced one vacuous
+       test.
+
+       So when writing a filter test, give the geography **at least two distinct
+       values across the fixture**, and assert against the unfiltered result
+       (``filtered < unfiltered``, or an exact id set) rather than an absolute
+       count -- an absolute count cannot distinguish "the filter matched
+       everything" from "the filter was never applied". The same reasoning
+       applies to any low-variety default: ``arrest``, ``domestic`` and the
+       offense columns are constants here too.
+
     Args:
         **overrides: Column values to replace in the default row.
 

@@ -181,8 +181,31 @@ def load(
     """Full-rebuild ``incidents`` from the Parquet dataset.
 
     Runs as a single transaction so a failure leaves the existing table intact:
-    apply schema, truncate, drop secondary indexes, ``COPY`` every partition,
-    recreate the indexes, and ``ANALYZE`` for fresh planner statistics.
+    drop and recreate the table from ``schema.sql``, drop secondary indexes,
+    ``COPY`` every partition, recreate the indexes, and ``ANALYZE`` for fresh
+    planner statistics.
+
+    **Why it drops rather than truncates.** ``schema.sql`` is written with
+    ``CREATE TABLE IF NOT EXISTS``, so against an existing table a newly added
+    column never arrives -- the load then dies at ``COPY`` with
+    ``UndefinedColumn``, which is exactly what adding ``stable_category`` did.
+    Dropping makes ``schema.sql`` authoritative for the whole table rather than
+    just its indexes, which is already this loader's stated design for indexes
+    (:func:`_drop_secondary_indexes` reads their names from ``pg_indexes`` and
+    recreates them by re-running the file). Postgres has transactional DDL, so
+    the "a failure leaves the existing table intact" guarantee survives: the
+    ``DROP`` rolls back with everything else. The lock level is unchanged --
+    ``TRUNCATE`` and ``DROP`` both take ACCESS EXCLUSIVE for the duration.
+
+    **Known regression:** ``DROP`` discards dependent objects that ``TRUNCATE``
+    preserved -- GRANTs, views, foreign keys. None exist today. If a deployed
+    database ever grows a read-only reporting role, its grants belong in
+    ``schema.sql`` so they are recreated with the table. ``DROP`` is deliberately
+    RESTRICT (the default), never ``CASCADE``: a future dependent object should
+    fail this load loudly rather than be silently destroyed by it.
+
+    This is the full-refresh path only. :func:`upsert`, the nightly incremental,
+    must never drop or truncate.
 
     Args:
         conn: An open connection.
@@ -199,8 +222,9 @@ def load(
     rows = 0
 
     with conn.transaction():
+        # RESTRICT (the default), never CASCADE -- see the docstring.
+        conn.execute("DROP TABLE IF EXISTS incidents")
         apply_schema(conn)
-        conn.execute("TRUNCATE incidents")
         _drop_secondary_indexes(conn)
 
         with conn.cursor() as cur, cur.copy(copy_stmt) as copy:

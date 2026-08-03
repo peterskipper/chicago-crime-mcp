@@ -28,10 +28,16 @@ def conn(tmp_path):
     """Build rollups over a fixture dataset; yield the open connection.
 
     The rows cover what the reader has to get right: three years, several
-    months, arrest/domestic/geocoded variation, two community areas, and two
-    codes the coverage report has to treat differently -- `0810`, which appears
-    only in the last year (an onset), and `1310`, which appears only in the
-    first and is silent long enough afterwards to count as retired.
+    months, arrest/domestic/geocoded variation, two community areas, two
+    districts, and two codes the coverage report has to treat differently --
+    `0810`, which appears only in the last year (an onset), and `1310`, which
+    appears only in the first and is silent long enough afterwards to count as
+    retired.
+
+    Every geography that any test filters on must take **at least two distinct
+    values here**. `helpers.row` defaults them all to one value, so a fixture
+    that leaves them alone gives a filter nothing to exclude, and the test then
+    passes whether the predicate is applied or not. See :func:`helpers.row`.
     """
     _write_partition(
         tmp_path / "parquet",
@@ -49,8 +55,10 @@ def conn(tmp_path):
             _row(id=1, date=datetime(2024, 1, 5), arrest=True, community_area=1),
             _row(id=2, date=datetime(2024, 1, 20), community_area=1),
             _row(id=3, date=datetime(2024, 2, 10), community_area=2, domestic=False),
-            _row(id=4, date=datetime(2024, 3, 15), community_area=1, latitude=None,
-                 longitude=None, domestic=False),
+            # The only row outside district 010, so a district filter has
+            # something to exclude.
+            _row(id=4, date=datetime(2024, 3, 15), community_area=1, district="011",
+                 latitude=None, longitude=None, domestic=False),
         ],
     )
     _write_partition(
@@ -187,18 +195,21 @@ def test_unpadded_district_still_matches(conn):
 
     The source stores districts zero-padded (`010`), so the unnormalized value
     would match nothing. This is the failure mode normalization exists to stop.
+
+    The filter is checked against the *unfiltered* total rather than an absolute
+    number, so the test fails if the predicate is dropped as well as if the
+    padding is. An absolute count cannot tell those apart.
     """
+    span = dict(start=date(2024, 1, 1), end=date(2024, 12, 31))
     result = queries.aggregate(
         conn,
-        queries.AggregateQuery(
-            start=date(2024, 1, 1),
-            end=date(2024, 12, 31),
-            geography="district",
-            geography_values=(10,),
-        ),
+        queries.AggregateQuery(geography="district", geography_values=(10,), **span),
     )
+    everything = queries.aggregate(conn, queries.AggregateQuery(**span))
+
     assert result.query.geography_values == ("010",)
-    assert _totals(result) == 4
+    assert _totals(result) == 3
+    assert _totals(result) < _totals(everything)  # the filter actually excluded a row
 
 
 def test_lowercase_type_filter_still_matches(conn):
