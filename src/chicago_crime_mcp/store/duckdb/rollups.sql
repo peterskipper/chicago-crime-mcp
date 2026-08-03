@@ -3,8 +3,9 @@
 -- These back the aggregate arm of the query router. Every table shares the same
 -- grain -- month x primary_type_canonical x stable_category x ONE geography --
 -- and the same four measures. The caller creates the `incidents` view over
--- Parquet and the `iucr_reference` table over the committed CSV before running
--- this file (see rollups.py); no path is hardcoded here.
+-- Parquet before running this file (see rollups.py); no path is hardcoded here.
+-- Both offense taxonomies arrive as columns in the Parquet, derived once at
+-- ingest -- nothing here re-derives them.
 --
 -- GRAIN: MONTH. Daily grain was measured and rejected: day x type x beat yields
 -- 2.33M groups from 2.88M source rows (81% of the row count), i.e. no
@@ -40,17 +41,29 @@
 -- normalized value would bake analytic policy into the rollups and make the raw
 -- counts unrecoverable.
 
--- Every rollup reads from here, not from `incidents` directly: the join tags each
--- row with its stable category, falling back to the canonical type for the ~99%
--- of codes with no curated override (and for rows whose IUCR is null or absent
--- from the reference). A LEFT JOIN, so an unknown code can never drop a row.
--- `iucr_reference` is created by rollups.py from the committed CSV.
+-- Every rollup reads from here, not from `incidents` directly.
+--
+-- This view used to compute `stable_category` itself, by LEFT JOINing the
+-- reference snapshot and coalescing onto `primary_type_canonical`. It no longer
+-- does: the column is derived once at ingest and materialized into Parquet (see
+-- ingest/schema.add_stable_category), which is what lets Postgres filter on it
+-- too. Deriving it here as well would mean two expressions of one rule -- and
+-- they differed in a real edge case, since this one fell back to the incident's
+-- canonical type while a Postgres-side equivalent would have fallen back to the
+-- reference's own label, disagreeing for any code absent from the snapshot.
+--
+-- The view is kept as the named relation the rollups and tier-3 scans read, so
+-- the reader has one place to point at, and so a future row-level derivation
+-- has somewhere to live. `iucr_reference` is still created by rollups.py from
+-- the committed CSV -- code_coverage below needs it for offense descriptions.
 CREATE OR REPLACE VIEW incidents_tagged AS
-SELECT
-    i.*,
-    coalesce(r.stable_category, i.primary_type_canonical) AS stable_category
-FROM incidents i
-LEFT JOIN iucr_reference r ON i.iucr = r.iucr;
+SELECT * FROM incidents;
+
+-- Drop the reference table the old view joined against. A database file built
+-- before this change still carries it, and nothing recreates it -- so without
+-- this, a rebuilt database keeps a stale copy of the curation forever. Dropped
+-- *after* the view is redefined, since the old view depends on it.
+DROP TABLE IF EXISTS iucr_reference;
 
 -- Citywide: no geography dimension. Tiny (~4k rows) and answers the most
 -- common shape of question ("<type> per month in Chicago") without a scan.

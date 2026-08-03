@@ -232,11 +232,16 @@ def test_no_rate_columns_are_stored(built):
 def drifted(tmp_path):
     """Build rollups over rows that exercise the real IUCR taxonomy drift.
 
-    Uses genuine codes, not invented ones, because the join is against the
-    committed reference snapshot: ``0610`` (BURGLARY / FORCIBLE ENTRY, no curated
-    override) and ``0760`` (BURGLARY FROM MOTOR VEHICLE, curated to THEFT because
-    it was minted mid-dataset and moved car break-ins out of THEFT). One row
-    carries an IUCR absent from the reference entirely.
+    Uses genuine codes rather than invented ones so the fixture matches what
+    ingest would really produce: ``0610`` (BURGLARY / FORCIBLE ENTRY, no curated
+    override, so both type columns agree) and ``0760`` (BURGLARY FROM MOTOR
+    VEHICLE, curated to THEFT because it was minted mid-dataset and moved car
+    break-ins out of THEFT). One row carries an IUCR absent from the reference
+    entirely, which ingest falls back to the canonical type for.
+
+    ``stable_category`` is set on the fixture rows because it arrives from
+    Parquet now -- the rollups consume it, they do not derive it. The derivation
+    itself is tested in ``test_schema.py``.
     """
     _write_partition(
         tmp_path / "parquet",
@@ -253,10 +258,13 @@ def drifted(tmp_path):
             _row(id=2, date=datetime(2025, 5, 1), iucr="0610",
                  primary_type_canonical="BURGLARY", community_area=22),
             _row(id=3, date=datetime(2025, 5, 2), iucr="0760",
-                 primary_type_canonical="BURGLARY", community_area=22),
+                 primary_type_canonical="BURGLARY", stable_category="THEFT",
+                 community_area=22),
             _row(id=4, date=datetime(2025, 6, 3), iucr="0760",
-                 primary_type_canonical="BURGLARY", community_area=22),
-            # An IUCR the snapshot has never heard of: the LEFT JOIN must keep it.
+                 primary_type_canonical="BURGLARY", stable_category="THEFT",
+                 community_area=22),
+            # An IUCR the snapshot has never heard of: ingest falls it back to the
+            # canonical type, and the rollups must carry it like any other row.
             _row(id=5, date=datetime(2025, 6, 4), iucr="9999",
                  primary_type_canonical="OTHER OFFENSE", community_area=22),
         ],
@@ -279,8 +287,8 @@ def test_stable_category_defaults_to_the_canonical_type(drifted):
     assert rows == [("BURGLARY", "BURGLARY")]
 
 
-def test_unknown_iucr_is_not_dropped_by_the_reference_join(drifted):
-    """The LEFT JOIN plus coalesce: an unmapped code falls back, never disappears."""
+def test_unknown_iucr_is_not_dropped(drifted):
+    """A code absent from the reference falls back and is still rolled up."""
     row = drifted.execute(
         "SELECT primary_type_canonical, stable_category, incidents FROM rollup_citywide "
         "WHERE primary_type_canonical = 'OTHER OFFENSE'"
@@ -340,36 +348,6 @@ def test_code_coverage_accounts_for_every_incident(drifted):
     source_rows = drifted.execute("SELECT source_rows FROM rollup_meta").fetchone()[0]
     covered = drifted.execute("SELECT sum(incidents) FROM code_coverage").fetchone()[0]
     assert covered == source_rows
-
-
-# --- the reference table ----------------------------------------------------
-
-
-def test_reference_table_preserves_zero_padded_codes(built):
-    """IUCR codes are identifiers: `0110` must not arrive as the integer 110."""
-    codes = built.execute(
-        "SELECT iucr FROM iucr_reference WHERE iucr IN ('0110', '0760')"
-    ).fetchall()
-    assert sorted(c[0] for c in codes) == ["0110", "0760"]
-
-
-def test_reference_table_reads_blank_curation_as_null(built):
-    """Blank `stable_category` must be NULL so the coalesce falls through."""
-    assert built.execute(
-        "SELECT stable_category FROM iucr_reference WHERE iucr = '0110'"
-    ).fetchone()[0] is None
-    assert built.execute(
-        "SELECT stable_category FROM iucr_reference WHERE iucr = '0760'"
-    ).fetchone()[0] == "THEFT"
-
-
-def test_ensure_iucr_reference_rejects_a_missing_snapshot(tmp_path):
-    import duckdb as duckdb_pkg
-
-    conn = duckdb_pkg.connect()
-    with pytest.raises(FileNotFoundError):
-        rollups.ensure_iucr_reference(conn, tmp_path / "absent.csv")
-    conn.close()
 
 
 # --- meta + rebuild ---------------------------------------------------------

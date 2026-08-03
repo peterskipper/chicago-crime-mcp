@@ -24,11 +24,17 @@ CREATE TABLE IF NOT EXISTS incidents (
 
     -- What: raw `primary_type` kept for provenance; `primary_type_canonical`
     -- (derived from the IUCR reference, falling back to raw) drives filters and
-    -- rollups. Non-null in all data observed to date; asserted NOT NULL so a
-    -- future null fails loudly rather than loading silently.
+    -- rollups. `stable_category` is the comparable taxonomy -- the curated
+    -- override for codes the city moved between primary types, falling back to
+    -- the canonical type. Both are derived once at ingest and landed in Parquet
+    -- (see ingest/schema.py), never re-derived here, so this store and DuckDB
+    -- cannot disagree about what a burglary is. Non-null in all data observed to
+    -- date; asserted NOT NULL so a future null fails loudly rather than loading
+    -- silently.
     iucr                    TEXT NOT NULL,
     primary_type            TEXT NOT NULL,
     primary_type_canonical  TEXT NOT NULL,
+    stable_category         TEXT NOT NULL,
     description             TEXT,
     fbi_code                TEXT,
 

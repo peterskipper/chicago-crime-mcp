@@ -1,7 +1,7 @@
 """Shared test helpers for building Parquet fixtures.
 
 The incident schema is defined once here rather than per test module: it mirrors
-the 21 coerced columns ``ingest`` writes, and a second copy would drift the first
+the 22 coerced columns ``ingest`` writes, and a second copy would drift the first
 time a column is added.
 
 Docstrings follow the Google Python style.
@@ -39,12 +39,18 @@ SCHEMA = pa.schema(
         ("latitude", pa.float64()),
         ("longitude", pa.float64()),
         ("primary_type_canonical", pa.string()),
+        ("stable_category", pa.string()),
     ]
 )
 
 
 def row(**overrides) -> dict:
     """A complete incident row with sane defaults; override only what matters.
+
+    ``stable_category`` defaults to whatever ``primary_type_canonical`` ends up
+    being, mirroring the real derivation (an uncurated code falls through to its
+    canonical type). So a test that overrides only the canonical type gets a
+    consistent row, and one exercising the curated remap sets both explicitly.
 
     Args:
         **overrides: Column values to replace in the default row.
@@ -76,6 +82,7 @@ def row(**overrides) -> dict:
         primary_type_canonical="BATTERY",
     )
     base.update(overrides)
+    base.setdefault("stable_category", base["primary_type_canonical"])
     return base
 
 

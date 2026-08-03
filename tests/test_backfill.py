@@ -26,6 +26,8 @@ ROWS = [
      "date": "2023-07-01T00:00:00.000", "arrest": "false", "beat": "0333"},
 ]
 REF = {"0810": "THEFT", "0281": "CRIMINAL SEXUAL ASSAULT"}
+# No override for either code, so stable_category mirrors the canonical type.
+CURATED: dict[str, str] = {}
 
 
 def crime_client(rows, count_override=None):
@@ -61,7 +63,7 @@ def test_year_where_bounds_the_year():
 def test_backfill_year_writes_partition_and_canonicalizes(tmp_path):
     client = crime_client(ROWS)
     # page_size=2 forces two keyset pages (2 rows, then 1).
-    result = backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2)
+    result = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
 
     assert result == {"year": 2023, "rows": 3, "expected": 3, "skipped": False}
     out = backfill.partition_path(2023, base=tmp_path)
@@ -74,6 +76,8 @@ def test_backfill_year_writes_partition_and_canonicalizes(tmp_path):
         "THEFT", "CRIMINAL SEXUAL ASSAULT", "CRIMINAL SEXUAL ASSAULT",
     ]
     assert "CRIM SEXUAL ASSAULT" in df["primary_type"].tolist()  # provenance kept
+    # Both taxonomies are materialized at ingest, so no store has to derive one.
+    assert df["stable_category"].tolist() == df["primary_type_canonical"].tolist()
     # dtypes were coerced and zero-padded beat survived.
     assert df["id"].dtype == "Int64"
     assert df["arrest"].dtype == "boolean"
@@ -82,17 +86,19 @@ def test_backfill_year_writes_partition_and_canonicalizes(tmp_path):
 
 def test_backfill_year_skips_when_complete(tmp_path):
     client = crime_client(ROWS)
-    backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2)
+    backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
     # second run: partition already holds all 3 rows -> skipped, not re-pulled.
-    again = backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2)
+    again = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
     assert again["skipped"] is True
     assert again["rows"] == 3
 
 
 def test_backfill_year_force_repulls(tmp_path):
     client = crime_client(ROWS)
-    backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2)
-    forced = backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2, force=True)
+    backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    forced = backfill.backfill_year(
+        client, 2023, REF, CURATED, base=tmp_path, page_size=2, force=True
+    )
     assert forced["skipped"] is False
     assert forced["rows"] == 3
 
@@ -105,7 +111,7 @@ def test_backfill_year_repulls_on_count_mismatch(tmp_path):
 
     # API reports 3 -> mismatch with the 1-row partition -> re-pull to 3.
     client = crime_client(ROWS)
-    result = backfill.backfill_year(client, 2023, REF, base=tmp_path, page_size=2)
+    result = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
     assert result["skipped"] is False
     assert result["rows"] == 3
     assert len(pd.read_parquet(out)) == 3
