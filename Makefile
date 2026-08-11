@@ -1,7 +1,7 @@
 .PHONY: install lint test ci
 
 install:
-	pip install -e ".[dev, store]"
+	pip install -e ".[dev, store, server]"
 
 lint:
 	ruff check src/ tests/

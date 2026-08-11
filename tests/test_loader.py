@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from chicago_crime_mcp.store.postgres import loader
@@ -91,11 +93,22 @@ def test_load_full_refresh_round_trip(tmp_path, pg_conn):
     ).fetchone()[0]
     assert round(lon, 4) == -87.6298
 
-    # Secondary indexes were recreated after the load (pkey + the 4 in schema.sql).
-    idx = pg_conn.execute(
-        "SELECT count(*) FROM pg_indexes WHERE tablename = 'incidents'"
-    ).fetchone()[0]
-    assert idx == 5
+    # Secondary indexes were recreated after the load. Asserted by name, not
+    # count: a rename would slip past a count and take a tool's index with it.
+    idx = {
+        name
+        for (name,) in pg_conn.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = 'incidents'"
+        ).fetchall()
+    }
+    assert idx == {
+        "incidents_pkey",
+        "incidents_geom_gix",
+        "incidents_date_idx",
+        "incidents_case_idx",
+        "incidents_ptc_date_idx",
+        "incidents_stable_date_idx",
+    }
 
     # Full refresh is idempotent: a second run replaces, not appends.
     loader.load(pg_conn, parquet_root=tmp_path)
@@ -166,3 +179,84 @@ def test_upsert_years_filter_scopes_to_requested_year(tmp_path, pg_conn):
         pg_conn.execute("SELECT primary_type FROM incidents WHERE id = 1").fetchone()[0]
         == "THEFT"
     )
+
+
+@pytest.mark.integration
+def test_refresh_picks_up_a_schema_column_added_since_the_table_was_created(tmp_path, pg_conn):
+    """The 2026-07-31 failure: schema.sql gains a column, the live table never gets it.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op against an existing table, so under
+    the old truncate-based refresh the new column never arrived and the load died
+    at COPY with `UndefinedColumn`. Reproduced here by creating the table from a
+    schema with `stable_category` stripped out, then refreshing with the real one.
+    """
+    # An "old" schema: the current file minus stable_category and its index. Built
+    # from the real file rather than hand-written, so it cannot drift from it.
+    real_schema = loader.SCHEMA_PATH.read_text()
+    old_schema = "\n".join(
+        line
+        for line in real_schema.splitlines()
+        if "stable_category" not in line and "incidents_stable_date_idx" not in line
+    )
+    old_path = tmp_path / "old_schema.sql"
+    old_path.write_text(old_schema)
+
+    loader.apply_schema(pg_conn, schema_path=old_path)
+    columns = "SELECT count(*) FROM information_schema.columns WHERE table_name='incidents'"
+    assert pg_conn.execute(f"{columns} AND column_name='stable_category'").fetchone()[0] == 0
+
+    _write_partition(tmp_path, 2025, [_row(id=1), _row(id=2)])
+    summary = loader.load(pg_conn, parquet_root=tmp_path)
+
+    assert summary == {"partitions": 1, "rows": 2}
+    assert pg_conn.execute(f"{columns} AND column_name='stable_category'").fetchone()[0] == 1
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 2
+
+
+@pytest.mark.integration
+def test_failed_refresh_rolls_the_drop_back(tmp_path, pg_conn):
+    """Postgres has transactional DDL, so the DROP is undone with everything else.
+
+    The refresh now drops the table before recreating it, which would be an
+    unacceptable trade if a mid-load failure could leave no table at all. It
+    cannot: the DROP is inside the same transaction as the COPY.
+    """
+    import psycopg  # lazy: unit-only runs must not need the `store` extras
+
+    _write_partition(tmp_path, 2025, [_row(id=1), _row(id=2)])
+    loader.load(pg_conn, parquet_root=tmp_path)
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 2
+
+    # A partition carrying a column the table has no home for: COPY fails after
+    # the DROP has already run.
+    bogus = pa.Table.from_pylist(
+        [{**_row(id=3), "not_a_real_column": "x"}],
+        schema=SCHEMA.append(pa.field("not_a_real_column", pa.string())),
+    )
+    (tmp_path / "year=2025").mkdir(parents=True, exist_ok=True)
+    pq.write_table(bogus, tmp_path / "year=2025" / "part.parquet")
+
+    with pytest.raises(psycopg.errors.UndefinedColumn):
+        loader.load(pg_conn, parquet_root=tmp_path)
+    pg_conn.rollback()
+
+    # Table and rows survived the failed refresh.
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 2
+
+
+@pytest.mark.integration
+def test_upsert_never_drops_the_table(tmp_path, pg_conn):
+    """The nightly path must stay non-destructive -- the DROP belongs to refresh only.
+
+    Checked by relfilenode: a drop-and-recreate gives the table a new one even
+    though the name and row count would look unchanged.
+    """
+    _write_partition(tmp_path, 2025, [_row(id=1)])
+    loader.load(pg_conn, parquet_root=tmp_path)
+    before = pg_conn.execute("SELECT 'incidents'::regclass::oid").fetchone()[0]
+
+    _write_partition(tmp_path, 2025, [_row(id=1), _row(id=2)])
+    loader.upsert(pg_conn, parquet_root=tmp_path)
+
+    assert pg_conn.execute("SELECT 'incidents'::regclass::oid").fetchone()[0] == before
+    assert pg_conn.execute("SELECT count(*) FROM incidents").fetchone()[0] == 2

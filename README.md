@@ -231,8 +231,8 @@ requested span to be flagged. Without that buffer the report is noise: a
 full-span query implicates 144 codes covering 1.22% of rows, mostly
 low-frequency ones that merely missed the opening or closing month — `141B`
 first appears in month 3 of 139 at ~17 incidents/month, which is sampling
-variation, not an introduction. Buffered, the same query reports 81 codes and
-0.40%. The threshold is deliberately symmetric. An earlier version buffered only
+variation, not an introduction. Buffered, the same query reports 82 codes and
+0.41%. The threshold is deliberately symmetric. An earlier version buffered only
 the retirement side, on the reasoning that a first appearance is an observed
 onset while a last appearance is right-censored by the end of the data. That
 asymmetry is real, but it isn't what makes the bounds noisy: both ends are noisy
@@ -246,6 +246,18 @@ carried as an extra dimension on every rollup table beside
 `taxonomy: "source"` (what the city called it) and `taxonomy: "comparable"`
 (what it means across time) — the mode is a tool parameter defaulting to
 `source`, and the envelope always names which was applied.
+
+**Derived once, at ingest.** Both type columns are computed in `ingest/schema.py`
+and materialized into Parquet, so Postgres and DuckDB read the same column and
+neither re-derives it. The alternative — each store applying the curation itself
+— was measured and rejected: a per-row join from the fact table to the reference
+costs 1 ms → 1 s on a full-span row search, because the `LIMIT` cannot be pushed
+below the join. Resolving the category to a set of codes first is as fast as a
+materialized column, but it still leaves two expressions of one rule, and they
+disagreed in a real edge case (which column the fallback reads for a code absent
+from the snapshot). One definition, one column, no store-side derivation. The
+cost is that re-curating a code means re-tagging the Parquet —
+`scripts/retag_parquet.py`, 3.2 s for all 2.88M rows — and reloading.
 
 The audit that produced the curation, over all 2.88M rows — every code whose
 lifespan is bounded inside the 2015–2026 window with ≥300 rows:

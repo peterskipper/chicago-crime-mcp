@@ -60,9 +60,12 @@ def partition_path(year: int, base: Path = PARQUET_DIR) -> Path:
     return base / f"year={year}" / "part.parquet"
 
 
-def _prepare(df: pd.DataFrame, reference: dict[str, str]) -> pd.DataFrame:
-    """Canonicalize then coerce a raw page-concatenated frame for storage."""
+def _prepare(
+    df: pd.DataFrame, reference: dict[str, str], curated: dict[str, str]
+) -> pd.DataFrame:
+    """Derive both offense taxonomies, then coerce, a raw frame for storage."""
     df = schema.add_canonical_primary_type(df, reference)
+    df = schema.add_stable_category(df, curated)
     return schema.coerce_types(df)
 
 
@@ -70,6 +73,7 @@ def backfill_year(
     client: SodaClient,
     year: int,
     reference: dict[str, str],
+    curated: dict[str, str],
     base: Path = PARQUET_DIR,
     force: bool = False,
     page_size: int = DEFAULT_PAGE_SIZE,
@@ -80,6 +84,7 @@ def backfill_year(
         client: An open :class:`SodaClient`.
         year: Four-digit year to pull.
         reference: An ``iucr -> primary_description`` map for canonicalization.
+        curated: An ``iucr -> stable_category`` map for the comparable taxonomy.
         base: Root directory of the partitioned dataset.
         force: Re-pull even if a complete partition already exists.
         page_size: Rows per keyset page.
@@ -120,7 +125,7 @@ def backfill_year(
         if frames
         else pd.DataFrame(columns=schema.SELECT_FIELDS)
     )
-    df = _prepare(df, reference)
+    df = _prepare(df, reference, curated)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(out_path, index=False, row_group_size=ROW_GROUP_SIZE)
@@ -137,8 +142,8 @@ def backfill(
 ) -> list[dict]:
     """Backfill an inclusive range of years to partitioned Parquet.
 
-    Loads the pinned IUCR reference once, then backfills each year in order.
-    Safe to re-run: complete years are skipped.
+    Loads the pinned IUCR reference and its curated overrides once, then
+    backfills each year in order. Safe to re-run: complete years are skipped.
 
     Args:
         client: An open :class:`SodaClient`.
@@ -155,9 +160,12 @@ def backfill(
         FileNotFoundError: If the IUCR snapshot has not been created.
     """
     reference = schema.load_iucr_reference()
+    curated = schema.load_stable_category_map()
     results = []
     for year in range(start_year, end_year + 1):
-        results.append(backfill_year(client, year, reference, base=base, force=force))
+        results.append(
+            backfill_year(client, year, reference, curated, base=base, force=force)
+        )
     total = sum(r["rows"] for r in results)
     log.info("backfill %d-%d complete: %d rows across %d years",
              start_year, end_year, total, len(results))

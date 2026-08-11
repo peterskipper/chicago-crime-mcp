@@ -195,6 +195,7 @@ def incremental_sync(
     if len(pulled):
         reference = schema.load_iucr_reference()
         pulled = schema.add_canonical_primary_type(pulled, reference)
+        pulled = schema.add_stable_category(pulled, schema.load_stable_category_map())
         pulled = schema.coerce_types(pulled)
         managed = managed_years(base)
         pyear = pulled["date"].dt.year

@@ -24,11 +24,17 @@ CREATE TABLE IF NOT EXISTS incidents (
 
     -- What: raw `primary_type` kept for provenance; `primary_type_canonical`
     -- (derived from the IUCR reference, falling back to raw) drives filters and
-    -- rollups. Non-null in all data observed to date; asserted NOT NULL so a
-    -- future null fails loudly rather than loading silently.
+    -- rollups. `stable_category` is the comparable taxonomy -- the curated
+    -- override for codes the city moved between primary types, falling back to
+    -- the canonical type. Both are derived once at ingest and landed in Parquet
+    -- (see ingest/schema.py), never re-derived here, so this store and DuckDB
+    -- cannot disagree about what a burglary is. Non-null in all data observed to
+    -- date; asserted NOT NULL so a future null fails loudly rather than loading
+    -- silently.
     iucr                    TEXT NOT NULL,
     primary_type            TEXT NOT NULL,
     primary_type_canonical  TEXT NOT NULL,
+    stable_category         TEXT NOT NULL,
     description             TEXT,
     fbi_code                TEXT,
 
@@ -67,11 +73,45 @@ CREATE TABLE IF NOT EXISTS incidents (
 -- loader, not before -- maintaining them per-row during a 2.9M-row load is slow.
 CREATE INDEX IF NOT EXISTS incidents_geom_gix ON incidents USING GIST (geom);              -- nearby_incidents (radius)
 CREATE INDEX IF NOT EXISTS incidents_date_idx ON incidents (date);                         -- time filters / ranges
-CREATE INDEX IF NOT EXISTS incidents_ptc_idx  ON incidents (primary_type_canonical);       -- filter/group by offense
 CREATE INDEX IF NOT EXISTS incidents_case_idx ON incidents (case_number);                  -- get_incident by case number
 
--- Deferred (add EXPLAIN-driven, once the tools that filter on them exist):
---   beat, district, community_area, ward. These are low-cardinality (e.g.
---   community_area has ~77 values over 2.9M rows), so a bare single-column index
---   is often not selective enough to beat a seq scan; when added they likely
---   want to be composites with `date` (e.g. (community_area, date)).
+-- search_incidents: one composite per taxonomy. The tool's shape is a category
+-- filter plus `ORDER BY date DESC, id DESC LIMIT n` (keyset pagination), so the
+-- index has to satisfy the predicate AND deliver the sort order, letting the
+-- planner stop after n rows instead of sorting the whole matching set. Two
+-- indexes rather than one because `taxonomy` picks the column at query time;
+-- neither serves the other. They replace a single-column index on
+-- primary_type_canonical, which a btree on (a, b, c) makes redundant -- it
+-- serves every predicate on (a) alone.
+--
+-- These do NOT speed up common categories, and that is expected. For THEFT or
+-- BATTERY the planner still prefers `incidents_date_idx` + an Incremental Sort,
+-- because walking `date` descending hits a full page of matches almost
+-- immediately. What they fix is the SELECTIVE case, where that same walk has to
+-- cross most of the table before it finds enough matches: a rare category with a
+-- few hundred rows in millions degraded to a near-full scan, orders of magnitude
+-- worse than everything else the tool does. With these it is an Index Only Scan.
+-- `stable_category` was the worse of the two, having had no index at all.
+--
+-- Column order is load-bearing: equality column first, then the range/sort
+-- columns. Leading with `date` instead is dramatically worse on that selective
+-- case -- the index no longer narrows by category, so the scan walks time order
+-- as before. `id` is not optional either: it is the keyset tiebreaker, and
+-- hundreds of rows can share one `date` value, so a date-only cursor cannot
+-- express "resume after this row". DESC is documentation rather than a
+-- requirement, since Postgres reads an ASC index backwards just as cheaply.
+-- Each index costs roughly a fifth of the heap.
+CREATE INDEX IF NOT EXISTS incidents_ptc_date_idx
+    ON incidents (primary_type_canonical, date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS incidents_stable_date_idx
+    ON incidents (stable_category, date DESC, id DESC);
+
+-- Deferred, and now checked rather than assumed -- beat, district,
+-- community_area and ward stay unindexed. A (community_area, date DESC, id DESC)
+-- composite was built and measured: the planner ignored it entirely, reading the
+-- same pages by the same plan, for another large index. These columns are
+-- low-cardinality (community_area has ~77 values over millions of rows), so a
+-- filter on one still matches a big fraction of the table and the date index
+-- plus a sort already wins. A bare (date DESC, id DESC) was similarly not worth
+-- its size -- `incidents_date_idx` plus an Incremental Sort covers that shape
+-- already. Revisit only for a query shape that actually measures badly.

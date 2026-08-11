@@ -10,6 +10,14 @@ time (e.g. ``CRIM SEXUAL ASSAULT`` was relabeled ``CRIMINAL SEXUAL ASSAULT``).
 The IUCR code is stable, so we derive a ``primary_type_canonical`` column purely
 from the IUCR reference and keep the raw ``primary_type`` for provenance.
 
+A second derived column, ``stable_category``, handles the other half of the
+problem: the city sometimes moves a *code* from one primary type to another, so
+even a canonical label breaks a long series. It applies the curated overrides in
+the reference snapshot on top of the canonical type. Both derivations happen
+**here**, once, and are materialized into Parquet -- and from there into every
+store -- so that no store re-derives them and none can disagree about what a
+burglary is. See the README's "On comparing crime over time".
+
 On-disk dtypes deliberately avoid pandas ``category``: category columns carry a
 per-file dictionary, which would make Hive-partitioned Parquet files
 schema-incompatible across years. Enum-like columns are stored as nullable
@@ -70,6 +78,7 @@ SELECT_FIELDS: list[str] = [
 # On-disk dtype groups (see module docstring on why enums are strings, not category).
 _STRING_COLS = [
     "case_number", "block", "iucr", "primary_type", "primary_type_canonical",
+    "stable_category",
     "description", "location_description", "fbi_code",
     "beat", "district",  # kept as strings: zero-padded codes ("0111") used for joins
 ]
@@ -189,6 +198,61 @@ def load_iucr_reference(path: Path = IUCR_REFERENCE_PATH) -> dict[str, str]:
     df = pd.read_csv(path, dtype=str)
     df["iucr"] = df["iucr"].map(normalize_iucr)
     return dict(zip(df["iucr"], df["primary_description"], strict=False))
+
+
+def load_stable_category_map(path: Path = IUCR_REFERENCE_PATH) -> dict[str, str]:
+    """Load the curated ``iucr -> stable_category`` overrides.
+
+    Only codes carrying a curated value are returned -- one today, ``0760``
+    BURGLARY FROM MOTOR VEHICLE, which the city moved out of THEFT. Every other
+    code keeps its canonical primary type, so an empty map would mean the two
+    taxonomies are identical.
+
+    The overrides are deliberately few: an override is warranted only when a
+    code crosses a primary-type boundary, never because a category's counts
+    moved. A genuine shift in enforcement or behaviour is the answer to the
+    user's question, not an artifact to normalize away.
+
+    Args:
+        path: Path to the snapshot CSV.
+
+    Returns:
+        A dict mapping normalized 4-char IUCR codes to their curated stable
+        category, omitting the codes with no override.
+
+    Raises:
+        FileNotFoundError: If the snapshot has not been created yet.
+    """
+    df = pd.read_csv(path, dtype=str)
+    df["iucr"] = df["iucr"].map(normalize_iucr)
+    curated = df[df["stable_category"].notna() & (df["stable_category"].str.strip() != "")]
+    return dict(zip(curated["iucr"], curated["stable_category"].str.strip(), strict=False))
+
+
+def add_stable_category(df: pd.DataFrame, curated: dict[str, str]) -> pd.DataFrame:
+    """Add a ``stable_category`` column: the curated override, else the canonical type.
+
+    This is the *comparable* taxonomy -- the offense grouping that holds still
+    when the city reclassifies a code -- and it is derived here rather than in
+    each store so that Postgres and DuckDB cannot drift apart on it.
+
+    Requires ``primary_type_canonical``, so call this after
+    :func:`add_canonical_primary_type`. Rows whose ``iucr`` is null, absent from
+    the reference, or simply uncurated fall through to that column unchanged.
+
+    Args:
+        df: Incident rows including ``iucr`` and ``primary_type_canonical``.
+        curated: An ``iucr -> stable_category`` map from
+            :func:`load_stable_category_map`.
+
+    Returns:
+        A copy of ``df`` with the added ``stable_category`` column.
+    """
+    iucr = df["iucr"].astype("string").map(normalize_iucr)
+    override = iucr.map(curated)
+    out = df.copy()
+    out["stable_category"] = override.fillna(df["primary_type_canonical"]).astype("string")
+    return out
 
 
 def add_canonical_primary_type(

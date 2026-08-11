@@ -88,6 +88,54 @@ def test_committed_snapshot_loads_and_maps():
     assert ref["0110"] == "HOMICIDE"
 
 
+# -- add_stable_category ---------------------------------------------------
+
+# The curated overrides: only codes that cross a primary-type boundary.
+CURATED = {"0760": "THEFT"}
+
+
+def test_stable_category_applies_the_curated_override():
+    df = pd.DataFrame(
+        {
+            "iucr": ["0760", "760"],  # already padded, and needing the zero-pad
+            "primary_type_canonical": ["BURGLARY", "BURGLARY"],
+        }
+    )
+    out = schema.add_stable_category(df, CURATED)
+    assert list(out["stable_category"]) == ["THEFT", "THEFT"]
+    # The source taxonomy is untouched: both are still BURGLARY to the city.
+    assert list(out["primary_type_canonical"]) == ["BURGLARY", "BURGLARY"]
+
+
+def test_stable_category_falls_back_to_the_canonical_type():
+    df = pd.DataFrame(
+        {
+            "iucr": ["0610", "9999", None],  # uncurated, unknown, null
+            "primary_type_canonical": ["BURGLARY", "OTHER OFFENSE", "ARSON"],
+        }
+    )
+    out = schema.add_stable_category(df, CURATED)
+    assert list(out["stable_category"]) == ["BURGLARY", "OTHER OFFENSE", "ARSON"]
+
+
+def test_stable_category_is_a_no_op_without_curation():
+    """An empty override map must leave the two taxonomies identical."""
+    df = pd.DataFrame(
+        {"iucr": ["0760", "0610"], "primary_type_canonical": ["BURGLARY", "BURGLARY"]}
+    )
+    out = schema.add_stable_category(df, {})
+    assert list(out["stable_category"]) == list(out["primary_type_canonical"])
+
+
+def test_committed_curation_is_loaded_with_padded_codes():
+    """IUCR codes are identifiers: `0760` must not arrive as the integer 760."""
+    curated = schema.load_stable_category_map()
+    assert curated["0760"] == "THEFT"
+    # Only curated codes are returned -- an uncurated one is absent, not blank.
+    assert "0110" not in curated
+    assert all(len(code) == 4 for code in curated)
+
+
 # -- coerce_types ----------------------------------------------------------
 
 

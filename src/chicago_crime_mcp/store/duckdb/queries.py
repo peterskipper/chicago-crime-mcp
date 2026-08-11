@@ -48,21 +48,18 @@ from chicago_crime_mcp.store.duckdb.rollups import (
     COVERAGE_TABLE,
     TAGGED_VIEW,
 )
+from chicago_crime_mcp.store.normalize import (
+    GEO_COLUMN,
+    TYPE_COLUMN,
+    Geography,
+    Taxonomy,
+    normalize_geography_values,
+    normalize_types,
+)
 
 #: Time buckets. All three are whole numbers of months, which is what lets the
 #: month-grain rollups answer every one of them by summing.
 Grain = Literal["month", "quarter", "year"]
-
-#: Geography dimension. ``citywide`` means no geography column at all, not a
-#: filter -- it selects the dimensionless rollup table.
-Geography = Literal["citywide", "beat", "district", "community_area", "ward"]
-
-#: Which offense taxonomy to group by. ``source`` reports what the city called
-#: it; ``comparable`` reports the curated stable category, which is what makes a
-#: cross-year comparison valid. See the README's "On comparing crime over time".
-#: Defaults to ``source`` everywhere: normalizing counts is an analytic choice
-#: the caller has to make explicitly, never one this layer makes for them.
-Taxonomy = Literal["source", "comparable"]
 
 Tier = Literal["rollup", "scan"]
 
@@ -75,28 +72,6 @@ _ROLLUP_TABLE: dict[Geography, str] = {
     "community_area": "rollup_community_area",
     "ward": "rollup_ward",
 }
-
-# The geography column carried by each rollup table (and by incidents_tagged,
-# which uses the same names). None for citywide: no column, no GROUP BY term.
-_GEO_COLUMN: dict[Geography, str | None] = {
-    "citywide": None,
-    "beat": "beat",
-    "district": "district",
-    "community_area": "community_area",
-    "ward": "ward",
-}
-
-_TYPE_COLUMN: dict[Taxonomy, str] = {
-    "source": "primary_type_canonical",
-    "comparable": "stable_category",
-}
-
-# Zero-padded string geographies, with their widths. The source feed stores beat
-# `1011` and district `010` as padded text, so a caller (or a model) passing the
-# integer 10 for a district would otherwise match nothing and get a confident,
-# empty, entirely wrong answer. ward and community_area are integers and are
-# coerced as such.
-_PADDED_GEOGRAPHIES: dict[str, int] = {"beat": 4, "district": 3}
 
 #: How many drifting offense codes the coverage report names. The share is
 #: always computed over *every* affected code; only the itemization is capped,
@@ -438,7 +413,7 @@ def categories(conn: duckdb.DuckDBPyConnection, taxonomy: Taxonomy = "source") -
     Returns:
         The distinct non-null categories, sorted.
     """
-    column = _TYPE_COLUMN[taxonomy]
+    column = TYPE_COLUMN[taxonomy]
     rows = conn.execute(
         f"SELECT DISTINCT {column} FROM rollup_citywide "
         f"WHERE {column} IS NOT NULL ORDER BY 1"
@@ -447,12 +422,12 @@ def categories(conn: duckdb.DuckDBPyConnection, taxonomy: Taxonomy = "source") -
 
 
 def _normalized(query: AggregateQuery) -> AggregateQuery:
-    """Coerce filter values to what the columns actually hold.
+    """Apply the shared filter coercion to an aggregate request.
 
-    Offense categories are stored upper-case; beats and districts are
-    zero-padded text; wards and community areas are integers. A caller that gets
-    any of these wrong would otherwise match nothing and receive a confident
-    empty answer, which is the worst failure mode available to us.
+    The rules live in :mod:`chicago_crime_mcp.store.normalize` because the
+    Postgres read API has to apply exactly the same ones; see that module for
+    why a divergence here would be silent rather than loud. This function only
+    maps them onto this store's query shape.
 
     Args:
         query: The request as supplied.
@@ -463,36 +438,11 @@ def _normalized(query: AggregateQuery) -> AggregateQuery:
     Raises:
         ValueError: If a numeric geography value is not numeric.
     """
-    types = tuple(t.strip().upper() for t in query.types)
-    return replace(query, types=types, geography_values=_normalize_geographies(query))
-
-
-def _normalize_geographies(query: AggregateQuery) -> tuple[str | int, ...]:
-    """Coerce geography values to the storage type of the chosen geography.
-
-    Args:
-        query: The request as supplied.
-
-    Returns:
-        The coerced values; empty for a citywide query, where a geography filter
-        is meaningless (there is no column to filter).
-
-    Raises:
-        ValueError: If a ward or community area is not an integer. The message
-            names the geography so the server can turn it into a teaching error.
-    """
-    if query.geography == "citywide":
-        return ()
-    width = _PADDED_GEOGRAPHIES.get(query.geography)
-    if width is not None:
-        return tuple(str(v).strip().zfill(width) for v in query.geography_values)
-    coerced: list[str | int] = []
-    for value in query.geography_values:
-        try:
-            coerced.append(int(str(value).strip()))
-        except ValueError as exc:
-            raise ValueError(f"{query.geography} must be an integer, got {value!r}") from exc
-    return tuple(coerced)
+    return replace(
+        query,
+        types=normalize_types(query.types),
+        geography_values=normalize_geography_values(query.geography, query.geography_values),
+    )
 
 
 def _route(query: AggregateQuery) -> tuple[Tier, str]:
@@ -555,8 +505,8 @@ def _build_aggregate_sql(query: AggregateQuery, tier: Tier) -> tuple[str, list]:
             "count(*) FILTER (WHERE latitude IS NOT NULL)",
         )
 
-    type_column = _TYPE_COLUMN[query.taxonomy]
-    geo_column = _GEO_COLUMN[query.geography]
+    type_column = TYPE_COLUMN[query.taxonomy]
+    geo_column = GEO_COLUMN[query.geography]
 
     # date_trunc over an already-truncated month column is a no-op for grain
     # 'month' and rolls months up cleanly for 'quarter' and 'year'.
@@ -609,7 +559,7 @@ def _to_row(record: tuple, query: AggregateQuery) -> AggregateRow:
     cursor = iter(record)
     period = next(cursor)
     category = next(cursor) if query.breakdown_by_type else None
-    geography = next(cursor) if _GEO_COLUMN[query.geography] is not None else None
+    geography = next(cursor) if GEO_COLUMN[query.geography] is not None else None
     incidents, arrests, domestic, geocoded = cursor
     return AggregateRow(
         period=period.date() if isinstance(period, datetime) else period,
@@ -651,7 +601,7 @@ def _coverage(
     Returns:
         The affected codes and the share of in-span rows they move.
     """
-    type_column = _TYPE_COLUMN[query.taxonomy]
+    type_column = TYPE_COLUMN[query.taxonomy]
     span_first_month = max(query.start, dataset.min_date.date()).replace(day=1)
     span_last_month = min(query.end, dataset.max_date.date()).replace(day=1)
 
