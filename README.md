@@ -10,8 +10,9 @@ purpose-built tools with schema validation and deliberate query routing —
 explicitly **not** a "hand the LLM a SQL prompt" text-to-SQL agent.
 
 > **Status:** under construction. The ingest and storage layers are built and
-> loaded (2.88M incidents, 2015 – present); the MCP tool surface is next. See the
-> roadmap below.
+> loaded (2.88M incidents, 2015 – present), and the five MCP tools run against
+> them end to end. Still outstanding in Phase 3: the Redis cache and
+> `resolve_neighborhood`. See the roadmap below.
 
 ## Architecture
 
@@ -95,18 +96,76 @@ Live API calls mean unpredictable latency, rate limits, no cross-dataset joins,
 and no query-plan control. The interesting engineering lives in the ingestion
 and serving layer, so incidents are ingested locally and served with routing.
 
+### The tool surface
+
+Five typed, purpose-built tools — no `run_sql` escape hatch. Every identifier
+that reaches SQL comes from a closed mapping keyed by a `Literal`; every value is
+bound as a parameter.
+
+| tool | answers | store |
+| --- | --- | --- |
+| `describe_schema` | "what's in here, and what counts as a valid value" | DuckDB |
+| `get_incident` | "tell me about this specific offense" | Postgres |
+| `search_incidents` | "which offenses match these filters" | Postgres |
+| `aggregate_incidents` | "how many, and has it changed" | DuckDB |
+| `nearby_incidents` | "what happens around this point" | Postgres |
+
+`resolve_neighborhood` (colloquial name → official geography) is designed but not
+yet built; it needs an alias-table design pass rather than a quick implementation.
+
 ### Designed for an agent to use correctly and fast
-The tool surface bakes in five affordances (expanded on as they're built):
-1. **Schema discovery** — a `describe_schema` tool exposes valid enum values and
-   the available date range, so the model doesn't guess.
-2. **Teaching errors** — malformed calls return structured, retry-safe errors
-   that name the bad field and its valid values, creating a self-correcting loop.
-3. **Entity resolution** — `resolve_neighborhood` maps fuzzy names to official
-   geography instead of letting the model invent IDs.
-4. **Result envelopes** — every response echoes the applied filters, row count, a
-   truncation flag, a page cursor, and the data-provenance caveat inline.
-5. **Bounded results + cursors** — hard caps with pagination so broad queries
-   degrade gracefully instead of dumping millions of rows.
+The tool surface bakes in five affordances:
+
+1. **Schema discovery** — `describe_schema` returns every closed set the other
+   tools validate against, read from the data rather than from a constant: the
+   offense categories under both taxonomies, and every beat, district, ward and
+   community area that actually occurs. About 9 KB, so a model can afford to read
+   it first. It also publishes the geocode rate by offense type and the caps
+   requests are held to.
+2. **Teaching errors** — an invalid value raises a structured error naming the
+   argument, echoing what it received, offering the nearest valid value, and
+   listing the valid set. `types=["BURGLERY"]` comes back as *"Did you mean
+   'BURGLARY'?"* with all 32 categories, so the model corrects itself without the
+   user seeing a failure. Values are checked **before** the query rather than
+   inferred from an empty result, because a filter list is an `OR`: one good
+   value in `["BURGLARY", "BURGLERY"]` would otherwise return a confident page
+   with the typo silently dropped.
+3. **Entity resolution** — `resolve_neighborhood` will map fuzzy names to official
+   geography instead of letting the model invent IDs. Not yet built.
+4. **Result envelopes** — every response echoes the filters *as actually applied
+   after normalization* (a caller passing district `10` reads back `"010"`, so it
+   can see its input was interpreted rather than ignored), the row count, a
+   truncation flag, a page cursor, which store answered and why, which offense
+   taxonomy was used, and the provenance inline. Qualifications ride along as
+   structured warnings — `provisional`, `partial_period`, `code_coverage_drift`,
+   `boundary_instability`, `excludes_ungeocoded`, `truncated`, `empty_result`,
+   `multiple_matches` — each with the numbers behind it, so a model can weigh a
+   caveat rather than only heed it.
+5. **Bounded results + cursors** — hard caps (200 rows, 2,000 aggregate buckets,
+   a 5 km radius) with keyset pagination, so broad queries degrade into pages
+   rather than into a payload nothing can read. Cursors are opaque and carry a
+   fingerprint of the normalized filters: replaying one against a *different*
+   query is rejected, because unbound it would return a plausible, non-empty,
+   silently-skipped page the model has no way to detect.
+
+Two details of the tool layer are worth calling out, because both were arrived at
+by measurement rather than by design:
+
+- **The rollup file is swapped, not written in place.** DuckDB takes an exclusive
+  lock, so the nightly rebuild cannot write the database a running server holds
+  open; it builds to a temp file and `os.replace()`s it. The server `stat()`s the
+  path per request and reopens on an inode change. Reopening has to *close* the
+  old connection first — DuckDB caches database instances by path, so a reopen
+  without a close hands back the same stale instance — which in turn means the
+  swap has to drain in-flight cursors before closing. Read-only throughout, so a
+  tool cannot mutate the rollups even by accident.
+- **The warm-up is a query, not a table scan.** Measured in fresh processes, the
+  first aggregate costs 488 ms cold. `SELECT 1` brings that to 265 ms and a
+  `count(*)` over every relation to 261 ms — both absorb the same one-time engine
+  start-up and nothing more. Only running one real, tiny aggregate at startup
+  (262 ms) takes the first real one to **3.6 ms**. The total is unchanged; what
+  changes is that it is paid where nobody is waiting instead of on a caller's
+  first question, and again after each nightly swap.
 
 ### Observability
 Every tool call is logged as structured JSON (trace id, args, resolved query
@@ -317,12 +376,24 @@ label up from the code, so no analytic judgment is involved.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,store]"    # dev tooling + storage-layer deps ([server] lands in Phase 3)
+pip install -e ".[dev,store,server]"   # dev tooling + storage layer + MCP server
 cp .env.example .env             # then paste your Socrata app token
 ```
 
-The `store` extra pulls the storage-layer drivers: `psycopg` (Postgres/PostGIS),
-`redis`, and `duckdb`.
+The `store` extra pulls the storage-layer drivers: `psycopg` + `psycopg-pool`
+(Postgres/PostGIS), `redis`, and `duckdb`. The `server` extra pulls `fastmcp` and
+`pydantic`.
+
+### Running the MCP server
+
+```bash
+chicago-crime-server                      # stdio, for a local MCP client
+chicago-crime-server --transport http     # Streamable HTTP, for the deployed service
+```
+
+Both stores are opened at startup, so a missing rollup database or an unreachable
+Postgres fails immediately rather than on the first tool call. Transport is a
+runtime choice; nothing else about the server differs between the two.
 
 ### Local storage stack (PostGIS + Redis)
 
@@ -383,7 +454,8 @@ python scripts/download_data.py inspect data/crimes_2025.parquet
 src/chicago_crime_mcp/
   ingest/      backfill + incremental sync from Socrata
   store/       Postgres/PostGIS, DuckDB, Redis + query routing
-  server/      MCP tools (typed, constrained, purpose-built)
+  server/      MCP tools (typed, constrained, purpose-built) + envelope, errors,
+               connection lifecycle
   geo/         boundary shapefiles + neighborhood resolution
   telemetry/   structured logging + failure telemetry
 scripts/       exploration-stage data puller
@@ -397,6 +469,8 @@ tests/
 - [x] **Phase 2** — storage & query routing (Postgres/PostGIS, DuckDB) — the
   Redis cache is deliberately held back to Phase 3, since a cache is only
   meaningful once there are real tool results worth caching
-- [ ] **Phase 3** — MCP tool surface + the five agent affordances
+- [ ] **Phase 3** — MCP tool surface + the five agent affordances — the five
+  tools, the result envelope and the teaching errors are built; the Redis cache
+  and `resolve_neighborhood` are still outstanding
 - [ ] **Phase 4** — observability, failure telemetry & tests
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo

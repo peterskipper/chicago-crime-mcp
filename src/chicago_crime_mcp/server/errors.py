@@ -28,6 +28,18 @@ echoed back. Nothing was wrong with the request; the answer is that there are
 none, and saying so in the error channel would teach the model to retry a query
 that is already correct.
 
+**Why these subclass FastMCP's own ``ToolError``.** That base class is how the
+framework is told a failure is deliberate and safe to show, and the difference
+is not cosmetic. Measured against a server raising anything else: FastMCP
+delivers a ``ToolError``'s message to the client **verbatim**, and logs a single
+line; any other exception is re-wrapped behind an "Error calling tool" prefix,
+is liable to be replaced wholesale when ``mask_error_details`` is on, and dumps
+a full rendered traceback to stderr on every occurrence -- for what is here the
+*expected* path, since a model guessing a category is how the self-correcting
+loop starts. An earlier version of this translated at the server boundary
+instead; it was dead code, because FastMCP catches and wraps the exception below
+any middleware, so the translation never ran.
+
 Docstrings follow the Google Python style.
 """
 
@@ -36,6 +48,8 @@ from __future__ import annotations
 import difflib
 from collections.abc import Iterable, Sequence
 from typing import Any, Literal
+
+from fastmcp.exceptions import ToolError as _FastMCPToolError
 
 #: Machine-readable error kinds. Closed on purpose: telemetry buckets on this,
 #: and a free-form string would make "malformed-arg rate by kind" unanswerable.
@@ -59,8 +73,12 @@ MAX_LISTED_VALUES = 40
 NEAREST_CUTOFF = 0.6
 
 
-class ToolError(Exception):
+class ToolError(_FastMCPToolError):
     """Base for every failure a tool reports to the model.
+
+    Subclasses FastMCP's ``ToolError`` so the framework passes the rendered
+    message through untouched rather than re-wrapping it -- see the module
+    docstring for the measured difference.
 
     Attributes:
         code: The machine-readable kind, for telemetry.

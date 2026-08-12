@@ -113,6 +113,10 @@ SUMMARY_COLUMNS: tuple[str, ...] = (
 #: Broad queries have to degrade into pagination rather than into a huge payload.
 MAX_LIMIT = 200
 
+#: Rows returned when the caller does not say. Small enough to read, large enough
+#: that most questions do not need a second page.
+DEFAULT_LIMIT = 50
+
 #: Rings in the :func:`nearby` distance histogram. Equal-width in metres, which
 #: means they are **not** equal in area -- an outer ring covers far more ground
 #: than an inner one, so the counts describe how far away incidents are, not how
@@ -129,28 +133,42 @@ MAX_RADIUS_M = 5000
 _FINGERPRINT_CHARS = 16
 
 
-def connect(dsn: str, **kwargs: Any) -> psycopg.Connection:
-    """Open a connection configured for this module's query shapes.
+#: Connection settings this module's query shapes depend on, in one place so
+#: that every way of opening a connection applies them.
+#:
+#: ``prepare_threshold=None`` disables psycopg's automatic server-side prepared
+#: statements. This is not a micro-optimisation: once a statement is prepared,
+#: Postgres may switch to a *generic* plan built without knowing the parameter
+#: values, and these queries are exactly the shape that punishes -- the same SQL
+#: is issued with a very common category one call and a very rare one the next,
+#: and the two want different plans. When the generic plan wins out, a selective
+#: filter falls off a cliff, orders of magnitude slower, after a handful of
+#: identical calls have gone through fine. The composite indexes in
+#: ``schema.sql`` immunise the category filters, but not filters on beat, ward
+#: or community area, so the setting stays.
+#:
+#: Exported rather than inlined into :func:`connect` because the server pools
+#: its connections, and a pool that opens them its own way would silently drop
+#: this. The pool passes this same mapping.
+CONNECT_KWARGS: dict[str, Any] = {"prepare_threshold": None}
 
-    ``prepare_threshold=None`` disables psycopg's automatic server-side
-    prepared statements. This is not a micro-optimisation: once a statement is
-    prepared, Postgres may switch to a *generic* plan built without knowing the
-    parameter values, and these queries are exactly the shape that punishes --
-    the same SQL is issued with a very common category one call and a very rare
-    one the next, and the two want different plans. When the generic plan wins
-    out, a selective filter falls off a cliff, orders of magnitude slower, after
-    a handful of identical calls have gone through fine. The composite indexes
-    in ``schema.sql`` immunise the category filters, but not filters on beat,
-    ward or community area, so the setting stays.
+
+def connect(dsn: str, **kwargs: Any) -> psycopg.Connection:
+    """Open a single connection configured for this module's query shapes.
+
+    See :data:`CONNECT_KWARGS` for what "configured" means and why it matters.
+    Suitable for scripts, tests and the stdio server; the HTTP server pools
+    instead, applying the same settings.
 
     Args:
         dsn: A libpq connection string, e.g. ``StoreConfig.database_url``.
-        **kwargs: Passed through to :func:`psycopg.connect`.
+        **kwargs: Passed through to :func:`psycopg.connect`, overriding
+            :data:`CONNECT_KWARGS` on a key collision.
 
     Returns:
         An open connection.
     """
-    return psycopg.connect(dsn, prepare_threshold=None, **kwargs)
+    return psycopg.connect(dsn, **{**CONNECT_KWARGS, **kwargs})
 
 
 @dataclass(frozen=True)
@@ -333,7 +351,7 @@ class SearchQuery:
     geography_values: tuple[str | int, ...] = ()
     arrest: bool | None = None
     domestic: bool | None = None
-    limit: int = 50
+    limit: int = DEFAULT_LIMIT
     cursor: str | None = None
 
     def __post_init__(self) -> None:
@@ -406,7 +424,7 @@ class NearbyQuery:
     domestic: bool | None = None
     nearest: int = 10
     include_rows: bool = False
-    limit: int = 50
+    limit: int = DEFAULT_LIMIT
 
     def __post_init__(self) -> None:
         """Reject requests that cannot be answered.

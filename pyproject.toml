@@ -20,12 +20,17 @@ dependencies = [
 chicago-crime-ingest = "chicago_crime_mcp.ingest.cli:main"
 chicago-crime-load = "chicago_crime_mcp.store.postgres.loader:main"
 chicago-crime-rollup = "chicago_crime_mcp.store.duckdb.rollups:main"
+chicago-crime-server = "chicago_crime_mcp.server.app:main"
 
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
 store = [
     "duckdb>=1.1",
     "psycopg[binary]>=3.2",
+    # Pooled connections for the HTTP server: a single psycopg connection is not
+    # safe to share across concurrent requests, and a naively pooled one would
+    # drop `prepare_threshold=None`. See store.postgres.queries.CONNECT_KWARGS.
+    "psycopg-pool>=3.2",
     "redis>=5.0",
 ]
 # Phase 3 - MCP tool surface
