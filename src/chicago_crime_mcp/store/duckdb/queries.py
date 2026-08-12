@@ -79,6 +79,17 @@ _ROLLUP_TABLE: dict[Geography, str] = {
 #: magnitude plus the worst offenders, not an inventory.
 MAX_COVERAGE_CODES = 10
 
+#: Hard ceiling on buckets returned by one aggregate, mirroring ``MAX_LIMIT`` on
+#: the Postgres side. Generous, because a bucket is a handful of integers rather
+#: than a row of text and a legitimate query can want a lot of them -- 12 years
+#: of months across 77 community areas broken down by category is a real
+#: question. It exists so that the *unbounded* version of that query degrades
+#: into a flagged truncation instead of into a payload nothing can read.
+MAX_LIMIT = 2000
+
+#: Buckets returned when the caller does not say.
+DEFAULT_LIMIT = 500
+
 #: How long a code must be absent from one end of the span before that absence
 #: counts as an introduction or a retirement rather than a gap.
 #:
@@ -139,20 +150,20 @@ class AggregateQuery:
     types: tuple[str, ...] = ()
     taxonomy: Taxonomy = "source"
     breakdown_by_type: bool = True
-    limit: int = 500
+    limit: int = DEFAULT_LIMIT
 
     def __post_init__(self) -> None:
         """Reject queries that cannot be answered, with a message naming the field.
 
         Raises:
-            ValueError: If the date range is inverted or the limit is not
-                positive. The server layer catches these and re-raises them as
+            ValueError: If the date range is inverted or the limit is out of
+                range. The server layer catches these and re-raises them as
                 the structured, self-correcting errors the model retries from.
         """
         if self.end < self.start:
             raise ValueError(f"end ({self.end}) is before start ({self.start})")
-        if self.limit < 1:
-            raise ValueError(f"limit must be at least 1, got {self.limit}")
+        if not 1 <= self.limit <= MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {MAX_LIMIT}, got {self.limit}")
 
 
 @dataclass(frozen=True)
@@ -296,6 +307,71 @@ class CoverageReport:
 
 
 @dataclass(frozen=True)
+class TypeGeocode:
+    """How much of one offense category carries coordinates.
+
+    Counts, never a stored rate -- see :class:`AggregateRow`. The rate is a
+    division the presenter does, which keeps two of these summable.
+
+    Attributes:
+        category: The offense category under the applied taxonomy.
+        incidents: Offenses of that category in scope.
+        geocoded: How many of them have coordinates.
+    """
+
+    category: str
+    incidents: int
+    geocoded: int
+
+    @property
+    def rate(self) -> float:
+        """Share of the category's offenses that have coordinates.
+
+        Returns:
+            A value in ``[0, 1]``; 0.0 when the category has no offenses.
+        """
+        return self.geocoded / self.incidents if self.incidents else 0.0
+
+
+@dataclass(frozen=True)
+class GeocodeCoverage:
+    """Geocoding completeness, overall and broken down by offense category.
+
+    Serves two callers with the same numbers. ``describe_schema`` publishes it
+    so a model knows before it asks that a radius query cannot see every
+    offense; ``nearby_incidents`` composes the per-category rates into its
+    warning, because the gap is *systematic by offense type and not by place* --
+    measured across the loaded window it spans roughly 91% to 100% by category
+    but under a point between community areas. That is why this lives on the
+    DuckDB side, where ``geocoded`` is already a rollup measure, rather than
+    being recomputed per radius call in Postgres against the axis that does not
+    vary.
+
+    Always citywide: the rollup that backs it is filtered by date and category
+    only, so a caller presenting it alongside a radius result has to say the
+    rate is the city's, not the circle's.
+
+    Attributes:
+        by_type: One entry per category in scope, most offenses first.
+        incidents: Offenses in scope, all categories.
+        geocoded: How many of them have coordinates.
+    """
+
+    by_type: tuple[TypeGeocode, ...]
+    incidents: int
+    geocoded: int
+
+    @property
+    def rate(self) -> float:
+        """Share of in-scope offenses that have coordinates.
+
+        Returns:
+            A value in ``[0, 1]``; 0.0 when nothing is in scope.
+        """
+        return self.geocoded / self.incidents if self.incidents else 0.0
+
+
+@dataclass(frozen=True)
 class AggregateResult:
     """The buckets plus everything the envelope needs to qualify them.
 
@@ -419,6 +495,99 @@ def categories(conn: duckdb.DuckDBPyConnection, taxonomy: Taxonomy = "source") -
         f"WHERE {column} IS NOT NULL ORDER BY 1"
     ).fetchall()
     return tuple(r[0] for r in rows)
+
+
+def geography_values(
+    conn: duckdb.DuckDBPyConnection, geography: Geography
+) -> tuple[str | int, ...]:
+    """List the values a geography dimension actually takes in the data.
+
+    Read from the data rather than from a fixed list, so a beat that CPD retires
+    stops being advertised and one it adds starts. Backs ``describe_schema``,
+    and the same set is what the tools check a caller's value against before
+    running a query that would otherwise return a confident empty page.
+
+    Args:
+        conn: An open connection to a built rollup database.
+        geography: Which dimension to enumerate.
+
+    Returns:
+        The distinct non-null values, sorted, in the column's storage type --
+        zero-padded strings for beat and district, integers for ward and
+        community area. Empty for ``citywide``, which has no column and so no
+        values.
+    """
+    column = GEO_COLUMN[geography]
+    if column is None:
+        return ()
+    table = _ROLLUP_TABLE[geography]
+    rows = conn.execute(
+        f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY 1"
+    ).fetchall()
+    return tuple(r[0] for r in rows)
+
+
+def geocode_coverage(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    taxonomy: Taxonomy = "source",
+    types: tuple[str, ...] = (),
+    start: date | None = None,
+    end: date | None = None,
+) -> GeocodeCoverage:
+    """Measure how much of the data carries coordinates, by offense category.
+
+    Answered from ``rollup_citywide``, where ``geocoded`` is a stored measure,
+    so this costs a scan of a few thousand pre-summed rows rather than of the
+    incident table.
+
+    The date bounds are **snapped to whole months**, because that is the finest
+    grain the rollup holds. For the callers this has -- publishing the rate in
+    ``describe_schema`` and qualifying a radius result -- a rate is a slowly
+    changing property of how CPD records an offense type, and rounding its
+    window to the enclosing months does not move it meaningfully. A caller that
+    needs the exact figure for an exact span should count it themselves.
+
+    Args:
+        conn: An open connection to a built rollup database.
+        taxonomy: Which taxonomy the categories are expressed in.
+        types: Restrict to these categories; empty means all of them. Assumed
+            already normalized, as the tools normalize before validating.
+        start: First day of interest. None means the start of the data.
+        end: Last day of interest, inclusive. None means the end of the data.
+
+    Returns:
+        The per-category and overall counts, citywide.
+    """
+    type_column = TYPE_COLUMN[taxonomy]
+    conditions: list[str] = []
+    params: list = []
+    if start is not None:
+        conditions.append("month >= date_trunc('month', CAST(? AS DATE))")
+        params.append(start)
+    if end is not None:
+        conditions.append("month <= date_trunc('month', CAST(? AS DATE))")
+        params.append(end)
+    if types:
+        conditions.append(f"{type_column} IN ({_placeholders(len(types))})")
+        params.extend(types)
+    where = f"WHERE {' AND '.join(conditions)} " if conditions else ""
+
+    rows = conn.execute(
+        f"SELECT {type_column}, sum(incidents), sum(geocoded) FROM rollup_citywide "
+        f"{where}GROUP BY 1 HAVING sum(incidents) > 0 ORDER BY 2 DESC",
+        params,
+    ).fetchall()
+    by_type = tuple(
+        TypeGeocode(category=category, incidents=int(incidents), geocoded=int(geocoded))
+        for category, incidents, geocoded in rows
+        if category is not None
+    )
+    return GeocodeCoverage(
+        by_type=by_type,
+        incidents=sum(t.incidents for t in by_type),
+        geocoded=sum(t.geocoded for t in by_type),
+    )
 
 
 def _normalized(query: AggregateQuery) -> AggregateQuery:
