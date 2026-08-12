@@ -11,8 +11,9 @@ explicitly **not** a "hand the LLM a SQL prompt" text-to-SQL agent.
 
 > **Status:** under construction. The ingest and storage layers are built and
 > loaded (2.88M incidents, 2015 – present), and the five MCP tools run against
-> them end to end. Still outstanding in Phase 3: the Redis cache and
-> `resolve_neighborhood`. See the roadmap below.
+> them end to end. Still outstanding in Phase 3: `resolve_neighborhood`. The
+> planned Redis cache was measured and cut — see "Why there is no cache". See the
+> roadmap below.
 
 ## Architecture
 
@@ -22,7 +23,6 @@ Socrata (SODA API)
       ▼
    Parquet  ──►  Postgres/PostGIS   (point lookups, case-number, spatial joins)
             ──►  DuckDB + rollups   (OLAP aggregates over 2.88M rows)
-            ──►  Redis              (cache-aside on hot results)
                        │  query router picks the right engine per tool
                        ▼
                    MCP server  ──►  LLM client (e.g. Anthropic API MCP connector)
@@ -55,8 +55,8 @@ it reads and whether measures sum stored counts or count rows
 (`store/duckdb/queries.py`), so "the tiers agree" is structural rather than
 something two hand-written queries have to keep true.
 
-The rollups are a latency and cacheability tier — they're what Redis will front
-— not a rescue for a slow query.
+The rollups are a latency tier, not a rescue for a slow query — and they are
+why there is no cache in front of them.
 
 **Rollup design** (`store/duckdb/rollups.sql`), five geography tables +
 provenance + two taxonomy-drift tables, 888k rows / 7.4 MB total, full rebuild
@@ -90,6 +90,64 @@ in ~0.85 s over 2.88M incidents:
 - **Refresh is always a full rebuild.** At under a second there is no case for
   incremental rollup maintenance — a deliberate contrast with the Postgres
   loader, where a multi-million-row `COPY` did justify a separate upsert path.
+
+### Why there is no cache
+A Redis cache-aside tier was planned from Phase 0 — it appeared in the
+architecture diagram, `docker-compose.yml` ran the container, and `StoreConfig`
+carried a `redis_url`. It was cut after measurement, and the container and config
+were removed with it.
+
+The reason is that the rollups had already done the cache's job. Comparing a full
+cache hit (Redis `GET` + JSON parse + model construction) against the full tool
+path it would replace — note these are **whole-tool** timings for a one-year
+query, so they are deliberately larger than the store-query figures in the
+routing table above, which time a full-span 2015–2026 aggregate at the SQL layer:
+
+| path | store query | + envelope | **total** | **cache hit** |
+|---|---|---|---|---|
+| rollup tier, ward × 12mo | 5.04 ms | 0.89 ms | **5.93 ms** | 1.40 ms (63 KB) |
+| rollup tier, citywide 12mo | 3.17 ms | 0.48 ms | **3.65 ms** | 1.13 ms (45 KB) |
+| live scan, ward, unaligned | 12.43 ms | 0.91 ms | **13.34 ms** | 1.57 ms (63 KB) |
+| live scan, citywide, unaligned | 10.95 ms | 0.49 ms | **11.44 ms** | 1.04 ms (46 KB) |
+
+The cache does win — and the win is single-digit milliseconds on a tool call
+sitting behind an LLM that spends orders of magnitude longer generating the
+tokens around it. A realistic question makes the point better than the stress
+shapes above: *"how many homicides in Logan Square last year"* is one category,
+one community area, one year — **2.27 ms** end to end, for a 1.1 KB response.
+That is the favourable case for a cache, and there is nothing in it worth saving.
+
+**The vocabulary is the clearest instance.** The closed sets every tool validates
+against (32 categories, 275 beats, 77 community areas, dataset provenance,
+per-category geocode rates) cost 6.29 ms to load from DuckDB — but they change
+only when the nightly rebuild lands, which `ServerContext` already detects via
+the rollup file's inode. So they are memoized in-process and served in **0.01 ms**,
+against **0.45 ms** for the same 5.8 KB over Redis. Nothing would front a
+memoized attribute with a network hop, so Redis could only ever serve the cold
+path: roughly 6 ms, once per process start.
+
+Both of the original cache's named candidates dissolved the same way. The second
+was neighborhood resolution — but that resolves against a static table of 77
+community areas plus aliases, which is a dict held next to the vocabulary on the
+same per-build invalidation boundary. It does not want a network hop either.
+
+**What would justify revisiting it.** The decision is scoped to this workload, not
+universal:
+
+- **A measured repeat rate.** The load-bearing assumption is that identical
+  normalized tool arguments rarely recur. That was reasoned, not measured — the
+  Phase 4 telemetry logs normalized args, so it can be settled with data rather
+  than argument.
+- **A genuinely expensive path.** Nothing here exceeds ~13 ms. A tool that
+  reached hundreds of milliseconds — or dropping the rollup tier, which is what
+  makes these numbers small — changes the arithmetic.
+- **State a single process cannot hold.** This is the honest case for Redis in
+  this server, and it is not caching: shared rate limiting or abuse control
+  across replicas on the public HTTP transport. That is Phase 5 scope.
+
+Note that the largest latency in the server is not a query at all. It is the
+~320–510 ms cold `ServerContext.open()`, which is DuckDB page-cache warming of a
+local file — something Redis cannot touch.
 
 ### Why the server doesn't call Socrata live
 Live API calls mean unpredictable latency, rate limits, no cross-dataset joins,
@@ -381,7 +439,7 @@ cp .env.example .env             # then paste your Socrata app token
 ```
 
 The `store` extra pulls the storage-layer drivers: `psycopg` + `psycopg-pool`
-(Postgres/PostGIS), `redis`, and `duckdb`. The `server` extra pulls `fastmcp` and
+(Postgres/PostGIS) and `duckdb`. The `server` extra pulls `fastmcp` and
 `pydantic`.
 
 ### Running the MCP server
@@ -395,23 +453,22 @@ Both stores are opened at startup, so a missing rollup database or an unreachabl
 Postgres fails immediately rather than on the first tool call. Transport is a
 runtime choice; nothing else about the server differs between the two.
 
-### Local storage stack (PostGIS + Redis)
+### Local storage stack (PostGIS)
 
-The storage layer routes across Postgres/PostGIS (point lookups + spatial
-queries) and Redis (cache-aside). `docker-compose.yml` brings both up locally:
+Postgres/PostGIS serves point lookups and spatial queries; DuckDB is in-process
+and needs no container. `docker-compose.yml` brings the one service up locally:
 
 ```bash
-docker compose up -d             # start PostGIS + Redis
-docker compose ps                # both should read "Up (healthy)"
+docker compose up -d             # start PostGIS
+docker compose ps                # should read "Up (healthy)"
 ```
 
-- Ports bind to `127.0.0.1` only, so the default dev credentials (`crime:crime`,
-  and Redis' no-auth default) are not reachable off-machine.
+- Ports bind to `127.0.0.1` only, so the default dev credentials (`crime:crime`)
+  are not reachable off-machine.
 - On Apple Silicon the local Postgres uses `imresamu/postgis` — a multi-arch
   rebuild of the amd64-only official PostGIS image (same PG 17 / PostGIS 3.5).
 - `StoreConfig.from_env()` defaults mirror the compose file, so a fresh checkout
-  connects with no `.env` changes; production overrides `DATABASE_URL` /
-  `REDIS_URL`.
+  connects with no `.env` changes; production overrides `DATABASE_URL`.
 
 Load the Parquet dataset into Postgres:
 
@@ -453,7 +510,7 @@ python scripts/download_data.py inspect data/crimes_2025.parquet
 ```
 src/chicago_crime_mcp/
   ingest/      backfill + incremental sync from Socrata
-  store/       Postgres/PostGIS, DuckDB, Redis + query routing
+  store/       Postgres/PostGIS, DuckDB + query routing
   server/      MCP tools (typed, constrained, purpose-built) + envelope, errors,
                connection lifecycle
   geo/         boundary shapefiles + neighborhood resolution
@@ -466,11 +523,10 @@ tests/
 
 - [x] **Phase 0** — project scaffolding
 - [x] **Phase 1** — ingestion (explore field shapes, then checkpointed backfill)
-- [x] **Phase 2** — storage & query routing (Postgres/PostGIS, DuckDB) — the
-  Redis cache is deliberately held back to Phase 3, since a cache is only
-  meaningful once there are real tool results worth caching
+- [x] **Phase 2** — storage & query routing (Postgres/PostGIS, DuckDB)
 - [ ] **Phase 3** — MCP tool surface + the five agent affordances — the five
-  tools, the result envelope and the teaching errors are built; the Redis cache
-  and `resolve_neighborhood` are still outstanding
+  tools, the result envelope and the teaching errors are built;
+  `resolve_neighborhood` is still outstanding. The Redis cache planned here was
+  measured and cut — see "Why there is no cache" 
 - [ ] **Phase 4** — observability, failure telemetry & tests
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo

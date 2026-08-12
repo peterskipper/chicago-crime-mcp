@@ -10,9 +10,10 @@ cheapest first:
    -> **a live DuckDB scan** over the same Parquet, via the ``incidents`` view
 
 Tier 3 matters: month grain genuinely cannot answer an arbitrary date range, and
-a documented fallback beats pretending otherwise. The rollups are a latency and
-cacheability tier (they are what Redis will front), not a rescue for a slow
-query -- a live scan of 2.88M rows already answers in ~24ms.
+a documented fallback beats pretending otherwise. The rollups are a latency
+tier, not a rescue for a slow query -- a live scan of 2.88M rows already answers
+in ~24ms. They are also the reason there is no cache in front of them: at ~2ms
+for a realistic aggregate they left a Redis round trip nothing worth saving.
 
 **Refresh is always a full rebuild.** ``CREATE OR REPLACE TABLE`` over the whole
 dataset measured 0.5s at 2.88M rows, so incremental rollup maintenance would add
