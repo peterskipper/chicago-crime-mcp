@@ -14,7 +14,6 @@ from chicago_crime_mcp.store.config import (
     DEFAULT_DATABASE_URL,
     DEFAULT_DUCKDB_PATH,
     DEFAULT_PARQUET_ROOT,
-    DEFAULT_REDIS_URL,
     StoreConfig,
 )
 
@@ -42,7 +41,6 @@ def _compose_default(name: str) -> str:
 def test_from_env_uses_defaults_when_empty():
     cfg = StoreConfig.from_env({})
     assert cfg.database_url == DEFAULT_DATABASE_URL
-    assert cfg.redis_url == DEFAULT_REDIS_URL
     assert cfg.parquet_root == DEFAULT_PARQUET_ROOT
     assert cfg.duckdb_path == DEFAULT_DUCKDB_PATH
 
@@ -50,13 +48,11 @@ def test_from_env_uses_defaults_when_empty():
 def test_from_env_reads_overrides():
     env = {
         "DATABASE_URL": "postgresql://u:p@db.internal:5432/prod",
-        "REDIS_URL": "redis://cache.internal:6379/1",
         "PARQUET_ROOT": "/mnt/volume/parquet",
         "DUCKDB_PATH": "/mnt/volume/crime.duckdb",
     }
     cfg = StoreConfig.from_env(env)
     assert cfg.database_url == env["DATABASE_URL"]
-    assert cfg.redis_url == env["REDIS_URL"]
     assert cfg.parquet_root == Path("/mnt/volume/parquet")
     assert cfg.duckdb_path == Path("/mnt/volume/crime.duckdb")
 
@@ -83,13 +79,27 @@ def test_default_database_url_matches_compose():
     )
 
 
-def test_default_redis_url_matches_compose():
-    # The Redis DB index (/0) is a client-side choice not expressed in compose;
-    # only the port is shared, so that is all we cross-check.
-    port = _compose_default("REDIS_PORT")
-    assert f":{port}/" in DEFAULT_REDIS_URL, (
-        f"DEFAULT_REDIS_URL ({DEFAULT_REDIS_URL!r}) does not use the "
-        f"docker-compose.yml Redis port ({port})."
+def test_there_is_no_cache_tier():
+    # The Redis cache was planned, measured, and cut -- see "Why there is no
+    # cache" in the README. This guards the decision rather than an
+    # implementation: the failure it prevents is half-reverting the cut, leaving
+    # a config field or a compose service for a tier nothing uses, which is the
+    # state the cut existed to clean up. Re-adding a cache should mean deleting
+    # this test on purpose, not discovering it went red.
+    assert not hasattr(StoreConfig(), "redis_url"), (
+        "StoreConfig has a redis_url again; if the cache decision was revisited, "
+        "update the README section and remove this test deliberately."
+    )
+    # Matches a service declaration (two-space-indented key under `services:`)
+    # or an image line, never prose -- the compose header explains the cut and
+    # names Redis on purpose.
+    compose = COMPOSE_FILE.read_text()
+    assert not re.search(r"^\s{2}redis:\s*$", compose, re.MULTILINE), (
+        "docker-compose.yml declares a redis service again; nothing in the "
+        "codebase connects to one."
+    )
+    assert not re.search(r"^\s*image:.*redis", compose, re.MULTILINE | re.IGNORECASE), (
+        "docker-compose.yml runs a redis image again; nothing connects to it."
     )
 
 

@@ -31,7 +31,6 @@ store = [
     # safe to share across concurrent requests, and a naively pooled one would
     # drop `prepare_threshold=None`. See store.postgres.queries.CONNECT_KWARGS.
     "psycopg-pool>=3.2",
-    "redis>=5.0",
 ]
 # Phase 3 - MCP tool surface
 server = [
@@ -62,9 +61,9 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Integration tests need a live Postgres/Redis; exclude them from the default
+# Integration tests need a live Postgres; exclude them from the default
 # (unit) run. Run them explicitly with `pytest -m integration`.
 addopts = "-ra -m 'not integration'"
 markers = [
-    "integration: requires a live Postgres/Redis (excluded by default)",
+    "integration: requires a live Postgres (excluded by default)",
 ]
