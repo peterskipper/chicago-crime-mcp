@@ -9,7 +9,14 @@ authors = [{ name = "Peter Skipper" }]
 
 # Core deps needed for ingestion/exploration (Phase 1). Heavier phases are
 # split into optional groups below so early setup stays light.
+#
+# duckdb is core rather than a `[store]` extra because ingest needs it: the
+# `neighborhood` column is a point-in-polygon test derived once at ingest, so a
+# backfill cannot run without the spatial extension. Note that `INSTALL spatial`
+# reaches the network on first use and caches to `~/.duckdb/extensions`, which
+# is why geometry-touching tests stay behind the `integration` marker.
 dependencies = [
+    "duckdb>=1.1",
     "httpx>=0.28",
     "pandas>=2.2",
     "pyarrow>=17",
@@ -25,7 +32,6 @@ chicago-crime-server = "chicago_crime_mcp.server.app:main"
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
 store = [
-    "duckdb>=1.1",
     "psycopg[binary]>=3.2",
     # Pooled connections for the HTTP server: a single psycopg connection is not
     # safe to share across concurrent requests, and a naively pooled one would
