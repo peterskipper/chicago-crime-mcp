@@ -10,6 +10,10 @@ hermetic starting state -- safe now that the target is a throwaway database.
 Postgres/psycopg imports are lazy (inside fixtures) so that unit-only runs, which
 never touch these fixtures, don't require the ``store`` dependencies.
 
+``spatial`` tests are a separate marker with a separate prerequisite: DuckDB's
+spatial extension, which downloads on first use rather than needing a server. A
+test that needs geometry wants :func:`spatial_conn`, not :func:`pg_conn`.
+
 Docstrings follow the Google Python style.
 """
 
@@ -95,4 +99,32 @@ def pg_conn(test_database_url):
     yield conn
     conn.execute("DROP TABLE IF EXISTS incidents CASCADE")
     conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def spatial_conn():
+    """A fresh in-memory DuckDB connection with the ``spatial`` extension loaded.
+
+    One connection per test, not per session, so each test gets its own catalog
+    and can create a ``neighborhoods`` table without colliding with its
+    neighbours. That is cheap: ``INSTALL`` downloads only on a cold machine and
+    then caches to ``~/.duckdb/extensions``, after which ``LOAD`` is local.
+
+    Yields:
+        The connection. Tests create their own tables on it.
+
+    Raises:
+        Skips the test if the extension cannot be installed, which on a cold
+        machine means the network was unreachable.
+    """
+    import duckdb
+
+    conn = duckdb.connect()
+    try:
+        conn.execute("INSTALL spatial; LOAD spatial;")
+    except duckdb.Error as exc:  # pragma: no cover - env dependent
+        conn.close()
+        pytest.skip(f"duckdb spatial extension unavailable: {exc}")
+    yield conn
     conn.close()

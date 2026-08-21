@@ -67,9 +67,14 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Integration tests need a live Postgres; exclude them from the default
-# (unit) run. Run them explicitly with `pytest -m integration`.
-addopts = "-ra -m 'not integration'"
+# Two kinds of test need something the default run should not assume, and they
+# need different things, so they get different markers rather than one blurred
+# one: `integration` wants a live Postgres, `spatial` wants DuckDB's spatial
+# extension, which downloads on first use and then caches to ~/.duckdb. Both are
+# excluded from `make test`, which stays hermetic and offline. Run them
+# explicitly with `pytest -m integration` or `pytest -m spatial`.
+addopts = "-ra -m 'not integration and not spatial'"
 markers = [
     "integration: requires a live Postgres (excluded by default)",
+    "spatial: requires DuckDB's spatial extension, which downloads on first use (excluded by default)",
 ]
