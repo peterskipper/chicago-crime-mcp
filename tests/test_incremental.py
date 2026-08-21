@@ -15,22 +15,32 @@ import pandas as pd
 
 from chicago_crime_mcp.ingest import incremental, schema
 from chicago_crime_mcp.ingest.socrata import SodaClient
+from tests.helpers import StubLocator
 
 REF = {"0810": "THEFT", "0281": "CRIMINAL SEXUAL ASSAULT"}
 
 INIT_2023 = [
     {"id": "1", "iucr": "0810", "primary_type": "THEFT",
      "date": "2023-01-15T00:00:00.000", "updated_on": "2023-01-20T00:00:00.000",
-     "arrest": "false"},
+     "arrest": "false", "latitude": "41.9088", "longitude": "-87.6796"},
     {"id": "2", "iucr": "0281", "primary_type": "CRIM SEXUAL ASSAULT",
      "date": "2023-02-15T00:00:00.000", "updated_on": "2023-02-20T00:00:00.000",
-     "arrest": "false"},
+     "arrest": "false", "latitude": "41.8781", "longitude": "-87.6298"},
 ]
+
+# Two real neighborhoods and one point in the lake, so a test can tell a row that
+# was tagged from one that merely defaulted.
+POLYGONS = {(41.9088, -87.6796): "Wicker Park", (41.8781, -87.6298): "Loop"}
+
+
+def locator() -> StubLocator:
+    """A fresh stub locator over POLYGONS."""
+    return StubLocator(POLYGONS)
 
 
 def write_partition(base, year, rows):
-    """Seed a coerced/canonicalized partition, as the backfill would."""
-    df = schema.coerce_types(schema.add_canonical_primary_type(pd.DataFrame(rows), REF))
+    """Seed a partition through the same pipeline the backfill runs."""
+    df = schema.prepare(pd.DataFrame(rows), REF, {}, locator())
     path = base / f"year={year}" / "part.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(path, index=False)
@@ -82,16 +92,17 @@ def test_sync_merges_updates_and_advances_watermark(tmp_path):
 
     updates = [
         # id 1 re-updated: arrest flips true, newer updated_on -> should replace.
+        # It also moved from Wicker Park to the Loop, so the tag must follow.
         {"id": "1", "iucr": "0810", "primary_type": "THEFT",
          "date": "2023-01-15T00:00:00.000", "updated_on": "2023-06-01T00:00:00.000",
-         "arrest": "true"},
-        # id 3 brand new in 2023 -> should be added.
+         "arrest": "true", "latitude": "41.8781", "longitude": "-87.6298"},
+        # id 3 brand new in 2023, and out in the lake -> added, but unlocatable.
         {"id": "3", "iucr": "0281", "primary_type": "CRIMINAL SEXUAL ASSAULT",
          "date": "2023-07-10T00:00:00.000", "updated_on": "2023-06-02T00:00:00.000",
-         "arrest": "false"},
+         "arrest": "false", "latitude": "41.8800", "longitude": "-87.5500"},
     ]
     summary = incremental.incremental_sync(
-        updates_client(updates), base=base, state_path=state
+        updates_client(updates), base=base, state_path=state, boundaries=locator()
     )
 
     assert summary["pulled"] == 2
@@ -103,6 +114,11 @@ def test_sync_merges_updates_and_advances_watermark(tmp_path):
     assert len(df) == 3
     assert df.loc[1, "arrest"]  # replaced row reflects the newer update
     assert 3 in df.index  # new row landed
+    # A nightly sync derives the same columns a backfill does, so the moved row
+    # is re-tagged and the lake row stays unlocatable.
+    assert df.loc[1, "neighborhood"] == "Loop", "was Wicker Park before the update"
+    assert df.loc[2, "neighborhood"] == "Loop", "untouched row keeps its tag"
+    assert pd.isna(df.loc[3, "neighborhood"])
     assert incremental.load_state(state)["watermark"].startswith("2023-06-02")
 
 
@@ -113,10 +129,11 @@ def test_sync_dedupes_keeping_latest_updated_on(tmp_path):
     stale = [
         {"id": "1", "iucr": "0810", "primary_type": "THEFT",
          "date": "2023-01-15T00:00:00.000", "updated_on": "2023-01-05T00:00:00.000",
-         "arrest": "true"},
+         "arrest": "true", "latitude": "41.8781", "longitude": "-87.6298"},
     ]
     incremental.incremental_sync(
-        updates_client(stale), base=base, state_path=tmp_path / "s.json"
+        updates_client(stale), base=base, state_path=tmp_path / "s.json",
+        boundaries=locator(),
     )
     df = pd.read_parquet(base / "year=2023" / "part.parquet").set_index("id")
     assert not df.loc[1, "arrest"]  # kept the newer 2023-01-20 row (arrest false)
@@ -131,6 +148,7 @@ def test_sync_uses_overlap_cutoff_in_query(tmp_path):
         base=base,
         state_path=tmp_path / "s.json",
         overlap=timedelta(days=1),
+        boundaries=locator(),
     )
     # cutoff = 2023-02-20 - 1 day = 2023-02-19
     assert "updated_on > '2023-02-19T00:00:00'" in captured[0].url.params["$where"]
@@ -142,10 +160,12 @@ def test_sync_skips_unmanaged_year(tmp_path):
     updates = [
         {"id": "9", "iucr": "0810", "primary_type": "THEFT",
          "date": "2005-04-01T00:00:00.000", "updated_on": "2023-06-01T00:00:00.000",
-         "arrest": "false"},  # a reclassified 2005 incident
+         "arrest": "false", "latitude": "41.8781",
+         "longitude": "-87.6298"},  # a reclassified 2005 incident
     ]
     summary = incremental.incremental_sync(
-        updates_client(updates), base=base, state_path=tmp_path / "s.json"
+        updates_client(updates), base=base, state_path=tmp_path / "s.json",
+        boundaries=locator(),
     )
     assert summary["skipped_unmanaged"] == 1
     assert summary["years"] == {}
@@ -156,7 +176,9 @@ def test_sync_no_updates_keeps_watermark(tmp_path):
     base = tmp_path / "parquet"
     write_partition(base, 2023, INIT_2023)
     state = tmp_path / "s.json"
-    summary = incremental.incremental_sync(updates_client([]), base=base, state_path=state)
+    summary = incremental.incremental_sync(
+        updates_client([]), base=base, state_path=state, boundaries=locator()
+    )
     assert summary["pulled"] == 0
     assert summary["years"] == {}
     assert summary["watermark"].startswith("2023-02-20")  # unchanged
@@ -168,5 +190,6 @@ def test_sync_without_watermark_or_partitions_raises(tmp_path):
 
     with pytest.raises(RuntimeError):
         incremental.incremental_sync(
-            updates_client([]), base=tmp_path / "empty", state_path=tmp_path / "s.json"
+            updates_client([]), base=tmp_path / "empty", state_path=tmp_path / "s.json",
+            boundaries=locator(),
         )

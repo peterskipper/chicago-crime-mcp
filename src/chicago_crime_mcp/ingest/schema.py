@@ -13,10 +13,20 @@ from the IUCR reference and keep the raw ``primary_type`` for provenance.
 A second derived column, ``stable_category``, handles the other half of the
 problem: the city sometimes moves a *code* from one primary type to another, so
 even a canonical label breaks a long series. It applies the curated overrides in
-the reference snapshot on top of the canonical type. Both derivations happen
-**here**, once, and are materialized into Parquet -- and from there into every
-store -- so that no store re-derives them and none can disagree about what a
-burglary is. See the README's "On comparing crime over time".
+the reference snapshot on top of the canonical type. See the README's "On
+comparing crime over time".
+
+A third, ``neighborhood``, answers a question the feed cannot: the city tags an
+incident with a beat, district, ward and community area, but not with the
+neighborhood people actually name. It is a point-in-polygon test against the 98
+published boundaries, and unlike the other two it is **nullable** -- roughly 1.8%
+of rows have no coordinates or fall outside every polygon.
+
+All three derivations happen **here**, once, and are materialized into Parquet --
+and from there into every store -- so that no store re-derives them and none can
+disagree about what a burglary is or where Wicker Park ends. :func:`prepare` is
+the single pipeline both the backfill and the incremental sync run, so a column
+added to one cannot go missing from the other.
 
 On-disk dtypes deliberately avoid pandas ``category``: category columns carry a
 per-file dictionary, which would make Hive-partitioned Parquet files
@@ -29,6 +39,7 @@ Docstrings follow the Google Python style.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Protocol
 
 import pandas as pd
 
@@ -78,7 +89,7 @@ SELECT_FIELDS: list[str] = [
 # On-disk dtype groups (see module docstring on why enums are strings, not category).
 _STRING_COLS = [
     "case_number", "block", "iucr", "primary_type", "primary_type_canonical",
-    "stable_category",
+    "stable_category", "neighborhood",
     "description", "location_description", "fbi_code",
     "beat", "district",  # kept as strings: zero-padded codes ("0111") used for joins
 ]
@@ -253,6 +264,85 @@ def add_stable_category(df: pd.DataFrame, curated: dict[str, str]) -> pd.DataFra
     out = df.copy()
     out["stable_category"] = override.fillna(df["primary_type_canonical"]).astype("string")
     return out
+
+
+class PointLocator(Protocol):
+    """The one thing :func:`add_neighborhood` needs from a set of polygons.
+
+    Narrowed to a protocol so this module stays free of geometry and of DuckDB:
+    the real implementation is
+    :class:`~chicago_crime_mcp.geo.boundaries.NeighborhoodBoundaries`, and a test
+    can pass a hand-written stub instead of installing the spatial extension.
+    """
+
+    def locate(self, latitude: pd.Series, longitude: pd.Series) -> pd.Series:
+        """Return the neighborhood containing each point, null where none does."""
+        ...
+
+
+def add_neighborhood(df: pd.DataFrame, boundaries: PointLocator) -> pd.DataFrame:
+    """Add a ``neighborhood`` column by locating each incident in a polygon.
+
+    The city publishes 98 named neighborhood boundaries but does not put them on
+    an incident, and the neighborhood is the geography people ask about: Wicker
+    Park is 21% of West Town, so answering from the community area covers roughly
+    five times the ground that was asked about.
+
+    **The result is nullable, by design.** Around 1.8% of rows get no
+    neighborhood -- some have no coordinates at all, the rest are geocoded into
+    the lake, onto the airport, or just outside the city edge. That is a fact
+    about the data, and a row that cannot be located is still a row.
+
+    Args:
+        df: Incident rows including ``latitude`` and ``longitude``. Values may
+            still be the strings SODA returns; they are coerced here, so this
+            works either side of :func:`coerce_types`.
+        boundaries: The polygons to test against, typically a
+            :class:`~chicago_crime_mcp.geo.boundaries.NeighborhoodBoundaries`.
+
+    Returns:
+        A copy of ``df`` with the added nullable ``neighborhood`` column.
+
+    Raises:
+        KeyError: If ``latitude`` or ``longitude`` is absent, which would mean
+            the pull dropped a field the column depends on.
+    """
+    out = df.copy()
+    out["neighborhood"] = boundaries.locate(df["latitude"], df["longitude"])
+    return out
+
+
+def prepare(
+    df: pd.DataFrame,
+    reference: dict[str, str],
+    curated: dict[str, str],
+    boundaries: PointLocator,
+) -> pd.DataFrame:
+    """Derive every column we add, then coerce, a raw frame for storage.
+
+    The one pipeline both ingest paths run. It lives here rather than in either
+    of them because it used to live in both: the backfill had a private helper
+    and the incremental sync repeated its body inline, which meant every new
+    derived column had to be remembered twice. A column reaching Parquet through
+    one path and not the other is precisely the drift these columns exist to
+    prevent.
+
+    Order matters once: ``stable_category`` reads ``primary_type_canonical``, so
+    canonicalization comes first.
+
+    Args:
+        df: Raw incident rows as returned by SODA.
+        reference: An ``iucr -> primary_description`` map for canonicalization.
+        curated: An ``iucr -> stable_category`` map for the comparable taxonomy.
+        boundaries: The polygons to derive ``neighborhood`` from.
+
+    Returns:
+        A copy of ``df`` with every derived column added and dtypes coerced.
+    """
+    df = add_canonical_primary_type(df, reference)
+    df = add_stable_category(df, curated)
+    df = add_neighborhood(df, boundaries)
+    return coerce_types(df)
 
 
 def add_canonical_primary_type(
