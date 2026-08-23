@@ -438,9 +438,10 @@ pip install -e ".[dev,store,server]"   # dev tooling + storage layer + MCP serve
 cp .env.example .env             # then paste your Socrata app token
 ```
 
-The `store` extra pulls the storage-layer drivers: `psycopg` + `psycopg-pool`
-(Postgres/PostGIS) and `duckdb`. The `server` extra pulls `fastmcp` and
-`pydantic`.
+The `store` extra pulls the Postgres drivers (`psycopg` + `psycopg-pool`); the
+`server` extra pulls `fastmcp` and `pydantic`. `duckdb` is a **core** dependency
+rather than an extra: ingest needs it for the point-in-polygon test that derives
+the `neighborhood` column, so a backfill cannot run without it.
 
 ### Running the MCP server
 
@@ -470,29 +471,94 @@ docker compose ps                # should read "Up (healthy)"
 - `StoreConfig.from_env()` defaults mirror the compose file, so a fresh checkout
   connects with no `.env` changes; production overrides `DATABASE_URL`.
 
-Load the Parquet dataset into Postgres:
+### Running the pipeline
+
+Ingest → store → serve. Each stage writes what the next one reads, and **Parquet
+is the source of truth**: both stores are rebuilt from it, so neither can drift
+from the other or invent a column of its own.
+
+From a clean checkout, in order:
 
 ```bash
-chicago-crime-load                       # full refresh (rebuild the incidents table)
-chicago-crime-load --mode upsert --years 2025 2026   # merge only changed partitions
+# 1. Backfill Socrata -> partitioned Parquet (data/parquet/year=YYYY/part.parquet).
+#    Defaults to 2015 through the current year. Checkpointed per year: a re-run
+#    skips any year whose partition already holds the row count the API reports,
+#    so an interrupted pull resumes cheaply. Needs SOCRATA_APP_TOKEN in .env --
+#    without one you are on the shared anonymous throttle and will see 429s.
+chicago-crime-ingest backfill
+chicago-crime-ingest backfill --start-year 2015 --end-year 2015 --force
+
+# 2. Parquet -> Postgres. Full refresh rebuilds the incidents table from scratch
+#    (~75s for 2.9M rows); upsert merges only the partitions that changed.
+chicago-crime-load
+chicago-crime-load --mode upsert --years 2025 2026
+
+# 3. Parquet -> DuckDB rollups. No services needed (DuckDB is embedded); writes
+#    to DUCKDB_PATH, default data/duckdb/crime.duckdb. Always rebuilds from
+#    scratch, so it is safe to re-run at any time (~1s).
+chicago-crime-rollup
+
+# 4. Serve.
+chicago-crime-server
 ```
 
-Build the DuckDB OLAP rollups from the same Parquet (no services needed — DuckDB
-is embedded; writes to `DUCKDB_PATH`, default `data/duckdb/crime.duckdb`):
+Step 1 derives three columns the incident feed does not carry —
+`primary_type_canonical`, `stable_category` and `neighborhood` — and lands them
+in Parquet. They are computed **once, at ingest**, never re-derived by a store.
+That is what stops Postgres and DuckDB disagreeing about what a burglary is or
+where Wicker Park ends. `chicago-crime-ingest` needs DuckDB's spatial extension
+for the neighborhood tag; it downloads on first use and caches to
+`~/.duckdb/extensions`.
+
+#### Keeping it current
+
+The nightly path pulls only rows whose `updated_on` moved past the stored
+watermark, rewrites the affected year partitions, then merges those years:
 
 ```bash
-chicago-crime-rollup                     # full rebuild of all five rollup tables
+chicago-crime-ingest incremental        # --overlap-days N re-pulls N days before
+                                        # the watermark, to catch late edits
+chicago-crime-load --mode upsert
+chicago-crime-rollup
 ```
 
-Run it after each ingest; it always rebuilds from scratch, so it is safe to
-re-run at any time.
+`incremental` only touches years that already have a partition. Updates to years
+you have never backfilled are counted and skipped, so run a backfill first if you
+widen the window — including at New Year, when the current year has no partition
+yet.
+
+#### Reference data and migrations
+
+Two snapshots are committed so ingest is reproducible and works offline: the IUCR
+code table and the neighborhood boundaries. Refresh them only deliberately —
+both scripts hit Socrata, and the curated columns they carry are ours, not the
+city's (see `src/chicago_crime_mcp/reference/`).
+
+```bash
+python scripts/build_neighborhood_reference.py --dry-run   # 98 polygons + containment table
+python scripts/retag_parquet.py --dry-run                  # report; drop the flag to write
+```
+
+`retag_parquet.py` is how a **new or changed derived column** reaches partitions
+already on disk, without re-pulling millions of rows to recompute something local.
+It runs the same `schema.prepare()` pipeline ingest runs, so a migrated partition
+is what a fresh backfill would have written, and it reports per-column change
+counts before writing anything — a re-run with nothing to do says so. Reload the
+stores afterwards (`chicago-crime-load` then `chicago-crime-rollup`).
 
 ### Running the tests
 
 ```bash
-pytest                    # unit tests only (default; no services needed)
-pytest -m integration     # integration tests (need the storage stack up)
+pytest                    # unit tests only (default; offline, no services needed)
+pytest -m integration     # need the storage stack up
+pytest -m spatial         # need DuckDB's spatial extension
 ```
+
+The default run is hermetic: no network, no database. The two excluded markers
+have genuinely different prerequisites, which is why they are separate —
+`integration` wants a live Postgres, `spatial` wants an extension that downloads
+on first use and then caches. Either skips with a clear message if what it needs
+is missing.
 
 Integration tests run against a **dedicated `<db>_test` database** that is created
 on demand, so they never touch the data you've loaded into the dev database
@@ -513,9 +579,11 @@ src/chicago_crime_mcp/
   store/       Postgres/PostGIS, DuckDB + query routing
   server/      MCP tools (typed, constrained, purpose-built) + envelope, errors,
                connection lifecycle
-  geo/         boundary shapefiles + neighborhood resolution
+  geo/         neighborhood polygons: point-in-polygon tagging (ingest) and
+               name resolution (server)
+  reference/   committed snapshots: IUCR codes, neighborhood boundaries + aliases
   telemetry/   structured logging + failure telemetry
-scripts/       exploration-stage data puller
+scripts/       exploration-stage data puller, reference refresh, Parquet migration
 tests/
 ```
 
