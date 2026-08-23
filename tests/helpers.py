@@ -158,6 +158,9 @@ class StubLocator:
         self._mapping = mapping or {}
         self.calls = 0
         self.closed = False
+        #: The distinct names this locator can produce, mirroring
+        #: ``NeighborhoodBoundaries.names``.
+        self.names = tuple(sorted(set(self._mapping.values())))
 
     def locate(self, latitude: pd.Series, longitude: pd.Series) -> pd.Series:
         """Look each point up in the mapping, null where it is absent."""
@@ -173,3 +176,11 @@ class StubLocator:
     def close(self) -> None:
         """Record that the owner released this locator."""
         self.closed = True
+
+    def __enter__(self) -> StubLocator:
+        """Enter a context manager, returning ``self``."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Exit the context manager, closing the locator."""
+        self.close()

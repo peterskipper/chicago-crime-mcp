@@ -1,7 +1,7 @@
 -- Postgres/PostGIS schema for the Chicago crime incidents table.
 --
 -- System of record for point lookups, case-number retrieval, radius/spatial
--- queries, and boundary containment. Columns mirror the 21 coerced fields the
+-- queries, and boundary containment. Columns mirror the 22 coerced fields the
 -- ingest layer lands in Parquet (see ingest/schema.py); `year` is deliberately
 -- absent (it is derivable from `date` and was a redundant Parquet partition key).
 --
@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS incidents (
     district                TEXT,
     ward                    SMALLINT,       -- domain ~1..50
     community_area          SMALLINT,       -- domain ~1..77
+
+    -- The sharper geography, and the only one the city does not supply: a
+    -- point-in-polygon tag against Chicago's 98 published neighborhood
+    -- boundaries, derived once at ingest (see geo/boundaries.py) and landed in
+    -- Parquet like the taxonomy columns, never re-derived here.
+    --
+    -- NULLABLE, unlike every other derived column: 1.84% of rows get no
+    -- neighborhood -- 1.55% are ungeocoded and a further ~0.3% are geocoded but
+    -- fall outside every polygon (the lake, the airport, the city edge). A NOT
+    -- NULL here would reject rows that are legitimately unlocatable. So
+    -- `community_area` remains the complete geography and this the precise one,
+    -- and an answer has to say which it used.
+    neighborhood            TEXT,
 
     -- Flags (real booleans in the feed; `domestic` = Illinois Domestic Violence
     -- Act qualifying, `arrest` = an arrest was made).
