@@ -103,7 +103,11 @@ class RouteInfo(BaseModel):
     invented for the store that has no equivalent.
 
     Attributes:
-        store: ``postgres`` or ``duckdb``.
+        store: ``postgres``, ``duckdb``, or ``reference`` for an answer that read
+            no incident data at all -- resolve_neighborhood is served entirely
+            from the pinned boundary and alias tables. Saying so is the point: a
+            caller can tell a name lookup from a query over 2.9M rows, and the
+            routing story stays honest about the case where there is no query.
         tier: The DuckDB tier -- ``rollup`` for pre-summed months, ``scan`` for
             a live read that answers a span the month grain cannot express.
             None for Postgres.
@@ -113,7 +117,9 @@ class RouteInfo(BaseModel):
             mapping and envelope construction.
     """
 
-    store: Literal["postgres", "duckdb"] = Field(description="Which store answered.")
+    store: Literal["postgres", "duckdb", "reference"] = Field(
+        description="Which store answered. 'reference' means no incident data was read."
+    )
     tier: str | None = Field(default=None, description="Rollup tier, for the DuckDB path.")
     table: str | None = Field(default=None, description="The relation read.")
     reason: str = Field(description="Why the query routed here.")

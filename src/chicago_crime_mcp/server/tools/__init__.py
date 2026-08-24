@@ -1,4 +1,4 @@
-"""The MCP tool surface: five purpose-built tools, no SQL escape hatch.
+"""The MCP tool surface: six purpose-built tools, no SQL escape hatch.
 
 Each tool is a plain function taking typed arguments and returning a validated
 model. They share one shape:
@@ -11,6 +11,11 @@ model. They share one shape:
 5. map the result into its payload model and assemble the envelope, attaching
    the warnings the store's facts imply.
 
+`resolve_neighborhood` is the exception to that shape: it reads no incident data
+and returns no page of rows, so it has its own model rather than an envelope. It
+is here because the name a person says is not always a value any column holds,
+and guessing at that inside the other tools was measured and found unsafe.
+
 Steps 2 and 5 are the reason this layer exists at all. The stores return facts
 and phrase nothing; the tools do the phrasing, so a wording change never
 reaches into a query plan and the same facts stay loggable and cacheable.
@@ -22,6 +27,7 @@ from chicago_crime_mcp.server.tools.aggregate_incidents import aggregate_inciden
 from chicago_crime_mcp.server.tools.describe_schema import describe_schema
 from chicago_crime_mcp.server.tools.get_incident import get_incident
 from chicago_crime_mcp.server.tools.nearby_incidents import nearby_incidents
+from chicago_crime_mcp.server.tools.resolve_neighborhood import resolve_neighborhood
 from chicago_crime_mcp.server.tools.search_incidents import search_incidents
 
 __all__ = [
@@ -29,5 +35,6 @@ __all__ = [
     "describe_schema",
     "get_incident",
     "nearby_incidents",
+    "resolve_neighborhood",
     "search_incidents",
 ]

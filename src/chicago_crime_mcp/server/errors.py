@@ -116,6 +116,7 @@ class ToolError(_FastMCPToolError):
         valid_values: Sequence[str] | None = None,
         nearest_match: str | None = None,
         suggest_nearest: bool = True,
+        max_listed: int = MAX_LISTED_VALUES,
         hint: str | None = None,
     ) -> None:
         """Build an error.
@@ -132,6 +133,10 @@ class ToolError(_FastMCPToolError):
                 See the note below; pass False for a set that is inherently
                 incomplete, where a near miss is more likely a real value that is
                 absent than a typo.
+            max_listed: How many valid values the rendered message spells out.
+                Raise it where the inventory *is* the answer rather than context
+                for one -- ``resolve_neighborhood`` lists all 98 names, which
+                costs about 1.3 KB and saves a round trip.
             hint: What to do next.
         """
         super().__init__(message)
@@ -147,6 +152,7 @@ class ToolError(_FastMCPToolError):
         ):
             nearest_match = suggest(received, self.valid_values)
         self.nearest_match = nearest_match
+        self.max_listed = max_listed
         self.hint = hint
 
     def details(self) -> dict[str, Any]:
@@ -189,10 +195,10 @@ class ToolError(_FastMCPToolError):
         if self.nearest_match is not None:
             parts.append(f"Did you mean {self.nearest_match!r}?")
         if self.valid_values:
-            shown = list(self.valid_values[:MAX_LISTED_VALUES])
+            shown = list(self.valid_values[: self.max_listed])
             listed = ", ".join(repr(v) for v in shown)
-            if len(self.valid_values) > MAX_LISTED_VALUES:
-                listed += f", ... ({len(self.valid_values) - MAX_LISTED_VALUES} more)"
+            if len(self.valid_values) > self.max_listed:
+                listed += f", ... ({len(self.valid_values) - self.max_listed} more)"
             parts.append(f"Valid values: {listed}.")
         if self.hint is not None:
             parts.append(self.hint)

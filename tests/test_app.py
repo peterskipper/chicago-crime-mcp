@@ -37,6 +37,7 @@ def test_every_tool_is_registered(listed):
         "search_incidents",
         "aggregate_incidents",
         "nearby_incidents",
+        "resolve_neighborhood",
     }
     assert len(TOOLS) == len(listed)
 

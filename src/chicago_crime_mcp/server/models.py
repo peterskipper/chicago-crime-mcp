@@ -33,7 +33,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from chicago_crime_mcp.server.envelope import ToolResult
+from chicago_crime_mcp.geo.resolve import MatchKind
+from chicago_crime_mcp.server.envelope import Provenance, RouteInfo, ToolResult
 from chicago_crime_mcp.store.normalize import Geography, Taxonomy
 
 
@@ -175,6 +176,82 @@ class NearbyIncidentModel(_StoreModel):
 
     incident: IncidentSummaryModel = Field(description="The compacted offense row.")
     distance_m: float = Field(description="Great-circle distance from the query point, metres.")
+
+
+class ContainingAreaModel(_StoreModel):
+    """A community area containing some or all of a resolved place."""
+
+    number: int = Field(
+        description="The community area number. This is what the rows carry, so this is what "
+        "geography_values takes."
+    )
+    name: str = Field(description="The community area's name, in the city's spelling.")
+    share_of_neighborhood: float | None = Field(
+        description="How much of the neighborhood falls inside this community area, 0-1. Null "
+        "when the neighborhood has no boundary of its own, so the overlap cannot be measured "
+        "at all -- not merely unknown."
+    )
+    share_of_area: float | None = Field(
+        description="How much of the community area the neighborhood covers, 0-1. This is the "
+        "number that says how much broader a community-area answer is than the question: 0.21 "
+        "means the answer covers roughly five times the ground asked about. Null for the same "
+        "reason as above."
+    )
+
+
+class NeighborhoodCandidateModel(_StoreModel):
+    """One way of interpreting the name that was asked about."""
+
+    match_kind: MatchKind = Field(
+        description="How this was arrived at. 'exact' and 'alias' are polygon-backed and answer "
+        "the question as asked. 'containing' is a real place with no boundary of its own, so the "
+        "answer widens to the community area holding it. 'suggestion' is a guess and must be "
+        "confirmed with the user before it is used."
+    )
+    label: str = Field(
+        description="The place itself, in its canonical spelling -- what was meant, not what was "
+        "typed."
+    )
+    geography: Geography = Field(
+        description="The geography argument this candidate answers under. Pass this together "
+        "with value; they are one pair and must not be mixed with another candidate's."
+    )
+    value: str | int = Field(
+        description="The value to pass as geography_values. A name for geography='neighborhood', "
+        "a number for geography='community_area'."
+    )
+    containing_areas: list[ContainingAreaModel] = Field(
+        description="The community areas this place sits in, widest share first. Usually one; six "
+        "neighborhoods straddle two."
+    )
+    score: float | None = Field(
+        default=None,
+        description="Similarity, 0-1, on a 'suggestion' only. Null elsewhere, because an exact "
+        "match has nothing to weigh."
+    )
+
+
+class NeighborhoodResolution(BaseModel):
+    """What resolve_neighborhood made of one name.
+
+    Deliberately not a ToolResult: row_count, cursor and truncated describe a
+    page of data, and this is not one. It follows describe_schema instead --
+    a payload plus the provenance and route every tool reports.
+    """
+
+    query: str = Field(description="The name as supplied, echoed back.")
+    resolved: bool = Field(
+        description="True when the name was resolved outright. False means every candidate is a "
+        "'suggestion': confirm one with the user before filtering on it, rather than picking the "
+        "highest score."
+    )
+    candidates: list[NeighborhoodCandidateModel] = Field(
+        description="Ranked interpretations, best first. Exactly one when resolved."
+    )
+    provenance: Provenance = Field(
+        description="Source, measure, caveats, and the window the data covers."
+    )
+    route: RouteInfo = Field(description="Which store answered, and why.")
 
 
 class LookupPayload(BaseModel):
