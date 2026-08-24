@@ -58,9 +58,9 @@ something two hand-written queries have to keep true.
 The rollups are a latency tier, not a rescue for a slow query — and they are
 why there is no cache in front of them.
 
-**Rollup design** (`store/duckdb/rollups.sql`), five geography tables +
-provenance + two taxonomy-drift tables, 888k rows / 7.4 MB total, full rebuild
-in ~0.85 s over 2.88M incidents:
+**Rollup design** (`store/duckdb/rollups.sql`), six geography tables +
+provenance + two taxonomy-drift tables, roughly a million rows, full rebuild in
+about a second over 2.88M incidents:
 
 - **Month grain, not day.** Measured: day × type × beat yields 2.33M groups from
   2.88M rows — 81% of the row count, so no compression and no benefit.

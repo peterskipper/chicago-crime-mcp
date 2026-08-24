@@ -26,10 +26,18 @@
 -- summed -- averaging rates across buckets of different sizes does not give the
 -- combined rate.
 --
--- NULL GEOGRAPHY BUCKETS ARE KEPT. 221 rows have a null community_area and 56 a
--- null ward. Dropping them would silently lose incidents; keeping them preserves
--- the invariant SUM(incidents) == source row count, which the tests assert on
--- every table.
+-- NULL GEOGRAPHY BUCKETS ARE KEPT. A couple of hundred rows have a null
+-- community_area and a few dozen a null ward. Dropping them would silently lose
+-- incidents; keeping them preserves the invariant SUM(incidents) == source row
+-- count, which the tests assert on every table.
+--
+-- `neighborhood` makes that rule matter rather than merely tidy. It is the one
+-- geography the city does not supply -- we derive it by point-in-polygon at
+-- ingest -- and it is null for close to 2% of rows, not a rounding error: some
+-- have no coordinates, others are geocoded into the lake or onto the airport.
+-- Those rows are real incidents. They belong in the null bucket, and a
+-- neighborhood-grouped answer has to acknowledge them rather than quietly
+-- returning a total that is 2% short.
 --
 -- TWO TYPE DIMENSIONS, NEVER ONE. Every table carries BOTH
 -- `primary_type_canonical` (what the city called it) and `stable_category` (what
@@ -112,8 +120,9 @@ FROM incidents_tagged
 GROUP BY ALL
 ORDER BY month, primary_type_canonical, district;
 
--- Community area: the 77 official community areas -- the geography most people
--- mean by "neighborhood" (resolve_neighborhood maps colloquial names to these).
+-- Community area: the 77 official community areas. Complete (every geocoded
+-- incident has one) but coarse -- see rollup_neighborhood below, which is the
+-- sharper geography and the one people usually mean.
 CREATE OR REPLACE TABLE rollup_community_area AS
 SELECT
     date_trunc('month', date)                    AS month,
@@ -127,6 +136,33 @@ SELECT
 FROM incidents_tagged
 GROUP BY ALL
 ORDER BY month, primary_type_canonical, community_area;
+
+-- Neighborhood: the 98 published neighborhood boundaries. Not a source field --
+-- this is our own point-in-polygon tag, derived once at ingest (see
+-- geo/boundaries.py) and read here like any other column.
+--
+-- It is the geography people actually name, and it is much sharper than the
+-- community area containing it: Wicker Park is about a fifth of West Town, so
+-- answering a question about one from the other is several times too broad.
+--
+-- The trade is completeness for precision, and it runs the opposite way to every
+-- other geography here. community_area is complete and coarse; this is precise
+-- and incomplete, null for close to 2% of rows. Both tables exist because
+-- neither answer is right for every question -- and whichever is used, the
+-- envelope has to say which.
+CREATE OR REPLACE TABLE rollup_neighborhood AS
+SELECT
+    date_trunc('month', date)                    AS month,
+    primary_type_canonical,
+    stable_category,
+    neighborhood,
+    count(*)                                     AS incidents,
+    count(*) FILTER (WHERE arrest)               AS arrests,
+    count(*) FILTER (WHERE domestic)             AS domestic,
+    count(*) FILTER (WHERE latitude IS NOT NULL) AS geocoded
+FROM incidents_tagged
+GROUP BY ALL
+ORDER BY month, primary_type_canonical, neighborhood;
 
 -- Ward: the 50 aldermanic wards (political, not police, geography).
 CREATE OR REPLACE TABLE rollup_ward AS
