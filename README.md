@@ -9,10 +9,10 @@ The design goal is a *system*, not a demo: a small surface of typed,
 purpose-built tools with schema validation and deliberate query routing —
 explicitly **not** a "hand the LLM a SQL prompt" text-to-SQL agent.
 
-> **Status:** under construction. The ingest and storage layers are built and
-> loaded (2.88M incidents, 2015 – present), and the five MCP tools run against
-> them end to end. Still outstanding in Phase 3: `resolve_neighborhood`. The
-> planned Redis cache was measured and cut — see "Why there is no cache". See the
+> **Status:** Phase 3 complete. The ingest and storage layers are built and
+> loaded (2.88M incidents, 2015 – present), and all six MCP tools run against
+> them end to end. The planned Redis cache was measured and cut — see "Why there
+> is no cache". Next is Phase 4, observability and failure telemetry. See the
 > roadmap below.
 
 ## Architecture
@@ -156,29 +156,31 @@ and serving layer, so incidents are ingested locally and served with routing.
 
 ### The tool surface
 
-Five typed, purpose-built tools — no `run_sql` escape hatch. Every identifier
+Six typed, purpose-built tools — no `run_sql` escape hatch. Every identifier
 that reaches SQL comes from a closed mapping keyed by a `Literal`; every value is
 bound as a parameter.
 
 | tool | answers | store |
 | --- | --- | --- |
 | `describe_schema` | "what's in here, and what counts as a valid value" | DuckDB |
+| `resolve_neighborhood` | "where is the place they just named" | reference tables |
 | `get_incident` | "tell me about this specific offense" | Postgres |
 | `search_incidents` | "which offenses match these filters" | Postgres |
 | `aggregate_incidents` | "how many, and has it changed" | DuckDB |
 | `nearby_incidents` | "what happens around this point" | Postgres |
 
-`resolve_neighborhood` (colloquial name → official geography) is designed but not
-yet built; it needs an alias-table design pass rather than a quick implementation.
+`resolve_neighborhood` reads no incident data at all, and its envelope says so —
+`store: "reference"`. A name lookup and a query over 2.9M rows should not look
+alike in the routing story.
 
 ### Designed for an agent to use correctly and fast
 The tool surface bakes in five affordances:
 
 1. **Schema discovery** — `describe_schema` returns every closed set the other
    tools validate against, read from the data rather than from a constant: the
-   offense categories under both taxonomies, and every beat, district, ward and
-   community area that actually occurs. About 9 KB, so a model can afford to read
-   it first. It also publishes the geocode rate by offense type and the caps
+   offense categories under both taxonomies, and every beat, district, ward,
+   community area and neighborhood that actually occurs. About 11 KB, so a model
+   can afford to read it first. It also publishes the geocode rate by offense type and the caps
    requests are held to.
 2. **Teaching errors** — an invalid value raises a structured error naming the
    argument, echoing what it received, offering the nearest valid value, and
@@ -188,8 +190,14 @@ The tool surface bakes in five affordances:
    inferred from an empty result, because a filter list is an `OR`: one good
    value in `["BURGLARY", "BURGLERY"]` would otherwise return a confident page
    with the typo silently dropped.
-3. **Entity resolution** — `resolve_neighborhood` will map fuzzy names to official
-   geography instead of letting the model invent IDs. Not yet built.
+3. **Entity resolution** — `resolve_neighborhood` maps the name a person says to
+   the geography that answers it, instead of letting the model pick the
+   closest-looking value from a list. It returns the match *kind*, so an answer
+   that had to widen can be reported as wider: `exact` and `alias` are
+   polygon-backed, `containing` fell back to the surrounding community area, and
+   `suggestion` is a guess the caller must confirm rather than filter on. See
+   "Neighborhoods versus community areas" below for why guessing is unsafe here
+   and safe almost everywhere else.
 4. **Result envelopes** — every response echoes the filters *as actually applied
    after normalization* (a caller passing district `10` reads back `"010"`, so it
    can see its input was interpreted rather than ignored), the row count, a
@@ -236,8 +244,16 @@ server only ever sees structured tool arguments, never the user's raw prompt.)
 
 Source: **Crimes — 2001 to Present** (`ijzp-q8t2`) from the
 [Chicago Data Portal](https://data.cityofchicago.org/), reported incidents
-extracted from CPD's CLEAR system, plus boundary shapefiles (community areas,
-wards, police beats).
+extracted from CPD's CLEAR system, plus the city's published
+**Neighborhoods_2012b** boundaries (`y6yq-dbs2`) and community areas
+(`igwz-8jzy`).
+
+**Three columns are ours, not CPD's**, and the tools say so: `primary_type_canonical`
+and `stable_category` (see "On comparing crime over time"), and `neighborhood` —
+a point-in-polygon test against those 98 published boundaries, because the feed
+carries a beat, district, ward and community area but not the geography people
+actually name. All three are derived once at ingest and materialized, never
+re-derived by a store.
 
 **Coverage: 2,884,106 incidents, 2015-01-01 through 2026-07-22**, a contiguous
 12-year window ingested as one Parquet partition per year. The full dataset
@@ -257,6 +273,72 @@ output:
 - CPD states it **should not be used for comparison purposes over time**.
 - Addresses are shown at **block level** to protect victim privacy, and deriving
   specific addresses from map visualizations is **prohibited**.
+
+### Neighborhoods versus community areas
+
+Chicago has 77 official community areas and 98 published neighborhood
+boundaries, and they are not the same geography. The community area is what the
+feed carries; the neighborhood is what people say.
+
+**Why bother deriving a second one.** A community area is often much bigger than
+the neighborhood inside it. Of the 98, 36 are strictly smaller than the area
+containing them, and among those the median covers about a quarter of it — so
+answering from the community area is typically around four times too broad, and
+at the extreme far worse: Greektown is 1% of the Near West Side. Concretely,
+2025 robberies in Wicker Park: **50** in the neighborhood, **177** across all of
+West Town. Same question, an answer 3.5× too big.
+
+**The trade runs the other way on completeness.** `community_area` is on every
+row; `neighborhood` is null for 1.84% — about 1.5% have no coordinates at all,
+and the rest are geocoded into the lake, onto the airport, or just outside every
+boundary. So neither is the right default: the precise geography is incomplete
+and the complete one is coarse. Both are queryable, the null bucket is kept
+rather than dropped, and the envelope reports which was used.
+
+**They are also two different kinds of fact**, which is worth knowing before
+reconciling totals. `neighborhood` is geometry applied to the published
+coordinates. `community_area` is an administrative field recorded in CLEAR — and
+it does not always agree with the city's own community-area boundary. For the 59
+neighborhoods whose polygon *is* a community area, the two counts agree closely
+(median within a third of a percent), but Hermosa is 14% apart, and a
+point-in-polygon test against the community-area boundary reproduces our
+neighborhood figure exactly. The geometry is consistent; the administrative
+field differs.
+
+**Why fuzzy name matching is a trap here.** The other closed sets this server
+validates against are *complete* — every offense category and beat the data holds
+is in the list — so a near miss is a typo and suggesting the nearest value is the
+most useful thing an error can do. The set of 98 neighborhood names is
+*inherently incomplete*: Pilsen, Bronzeville, Back of the Yards and Boystown are
+real places, and only one of those has a boundary of its own. Run the same
+matcher on them and it answers with total confidence and total inaccuracy —
+**`Bronzeville` comes back as `Andersonville`, 19.4 km away at the opposite end
+of the city**, with a plausible incident count attached and nothing to tell a
+model it is wrong.
+
+So the same matcher is safe in one place and dangerous in the other, and
+`resolve_neighborhood` exists to keep them apart. It resolves through a ladder,
+and every answer names which rung it came from:
+
+| kind | means | you get |
+| --- | --- | --- |
+| `exact` | normalized match against the 98 (case, spacing and a leading "the" don't matter) | the neighborhood |
+| `alias` | curated pointer to one of the 98 — `Boys Town` → `Boystown` | the neighborhood |
+| `containing` | a real place with no boundary — `Pilsen` → Lower West Side | the **community area**, broader than asked |
+| `suggestion` | nothing matched; here is a guess, with its score | **confirm before using** |
+| miss | not close to anything | an error listing all 98 resolvable names |
+
+Curated aliases are the safety mechanism, not a convenience: an alias row is what
+stands between "Bronzeville" and Andersonville. The table is deliberately small
+and deliberately unfinished — there is no complete list of what Chicagoans call
+places — so Phase 4 treats resolution misses as the telemetry signal for what to
+add next.
+
+Six neighborhoods straddle two community areas (Englewood, Garfield Park,
+Humboldt Park, Jackson Park, Old Town, Streeterville). All six have boundaries,
+so `geography="neighborhood"` still answers them exactly; the split only matters
+when translating to a community area, and both areas are reported with their
+shares.
 
 ### On comparing crime over time
 
@@ -626,7 +708,7 @@ src/chicago_crime_mcp/
                name resolution (server)
   reference/   committed snapshots: IUCR codes, neighborhood boundaries + aliases
   telemetry/   structured logging + failure telemetry
-scripts/       exploration-stage data puller, reference refresh, Parquet migration
+scripts/       data puller, reference refresh, Parquet migration, query-plan tool
 tests/
 ```
 
@@ -635,9 +717,9 @@ tests/
 - [x] **Phase 0** — project scaffolding
 - [x] **Phase 1** — ingestion (explore field shapes, then checkpointed backfill)
 - [x] **Phase 2** — storage & query routing (Postgres/PostGIS, DuckDB)
-- [ ] **Phase 3** — MCP tool surface + the five agent affordances — the five
-  tools, the result envelope and the teaching errors are built;
-  `resolve_neighborhood` is still outstanding. The Redis cache planned here was
-  measured and cut — see "Why there is no cache" 
+- [x] **Phase 3** — MCP tool surface + the five agent affordances — six tools,
+  the result envelope, the teaching errors and `resolve_neighborhood`, which
+  closes entity resolution. The Redis cache planned here was measured and cut —
+  see "Why there is no cache"
 - [ ] **Phase 4** — observability, failure telemetry & tests
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo
