@@ -41,6 +41,34 @@ def test_unknown_value_infers_the_nearest_match():
     assert err.nearest_match == "THEFT"
 
 
+def test_suggestion_can_be_suppressed_for_an_incomplete_set():
+    """The safety valve for neighborhood names.
+
+    Every other closed set the tools validate against is complete, so a value
+    just outside it is a typo and the nearest member is the useful answer. The
+    98 named neighborhood boundaries are not every name Chicagoans use, so a miss
+    is usually a real place with no polygon -- and difflib answers those
+    confidently and wrongly. Measured: 'Bronzeville' comes back as
+    'Andersonville', 19.4 km away at the opposite end of the city.
+    """
+    err = UnknownValueError(
+        "no such neighborhood",
+        received="Bronzeville",
+        valid_values=("Andersonville", "Grand Boulevard", "Wicker Park"),
+        suggest_nearest=False,
+    )
+    assert err.nearest_match is None
+    assert "Andersonville" not in (err.details().get("nearest_match") or "")
+
+    # Same input, same values, suggestion left on: this is what it would have said.
+    unguarded = UnknownValueError(
+        "no such neighborhood",
+        received="Bronzeville",
+        valid_values=("Andersonville", "Grand Boulevard", "Wicker Park"),
+    )
+    assert unguarded.nearest_match == "Andersonville"
+
+
 def test_an_explicit_nearest_match_is_not_overridden():
     err = UnknownValueError("Unknown category.", field="types", received="THEFF",
                             valid_values=CATEGORIES, nearest_match="ARSON")

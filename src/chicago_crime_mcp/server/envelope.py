@@ -66,8 +66,14 @@ WarningCode = Literal[
 ]
 
 #: Geographies whose boundaries have been redrawn inside the dataset's window.
-#: Community areas are the only stable long series -- see the README's "On
-#: comparing crime over time".
+#: Community areas are the only stable long series in the feed itself -- see the
+#: README's "On comparing crime over time".
+#:
+#: `neighborhood` is absent because it cannot drift: every year is tagged against
+#: one vendored boundary snapshot, so the outline is identical in 2015 and 2026
+#: by construction. That is a stronger guarantee than the feed's own geographies
+#: give, and a narrower one -- it means a genuine change to a neighborhood's
+#: real-world outline would not be reflected until the snapshot is refreshed.
 _UNSTABLE_GEOGRAPHIES: tuple[Geography, ...] = ("ward", "district", "beat")
 
 #: Share of rows from drifting codes below which the coverage warning is not

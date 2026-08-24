@@ -69,7 +69,7 @@ def test_every_parameter_is_documented(listed):
         (
             "aggregate_incidents",
             "geography",
-            {"citywide", "beat", "district", "community_area", "ward"},
+            {"citywide", "beat", "district", "community_area", "neighborhood", "ward"},
         ),
     ],
 )

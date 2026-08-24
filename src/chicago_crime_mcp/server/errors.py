@@ -72,6 +72,17 @@ MAX_LISTED_VALUES = 40
 #: wrong suggestion is worse than none: the model will take it.
 NEAREST_CUTOFF = 0.6
 
+# WHEN A SUGGESTION IS SAFE AT ALL. Every closed set here is complete -- it lists
+# what the data actually contains -- so a value just outside it is almost always
+# a typo, and proposing the nearest member is the most useful thing an error can
+# do. Neighborhood names break that assumption and are the reason
+# `suggest_nearest` exists: the 98 named boundaries are not every name Chicagoans
+# use, so a miss is usually a real place with no polygon rather than a
+# misspelling. Measured against real input, difflib answers "Bronzeville" with
+# "Andersonville" -- 19.4 km away, at the opposite end of the city, and a
+# perfectly fluent wrong answer. resolve_neighborhood exists to handle those
+# properly; an error must not pre-empt it with a guess.
+
 
 class ToolError(_FastMCPToolError):
     """Base for every failure a tool reports to the model.
@@ -104,6 +115,7 @@ class ToolError(_FastMCPToolError):
         received: Any = None,
         valid_values: Sequence[str] | None = None,
         nearest_match: str | None = None,
+        suggest_nearest: bool = True,
         hint: str | None = None,
     ) -> None:
         """Build an error.
@@ -116,6 +128,10 @@ class ToolError(_FastMCPToolError):
             nearest_match: An explicit suggestion. When omitted and both
                 ``received`` and ``valid_values`` are present, one is inferred
                 with :func:`suggest`.
+            suggest_nearest: Whether inferring a suggestion is safe for this set.
+                See the note below; pass False for a set that is inherently
+                incomplete, where a near miss is more likely a real value that is
+                absent than a typo.
             hint: What to do next.
         """
         super().__init__(message)
@@ -123,7 +139,12 @@ class ToolError(_FastMCPToolError):
         self.field = field
         self.received = received
         self.valid_values = tuple(valid_values) if valid_values is not None else None
-        if nearest_match is None and self.valid_values and isinstance(received, str):
+        if (
+            nearest_match is None
+            and suggest_nearest
+            and self.valid_values
+            and isinstance(received, str)
+        ):
             nearest_match = suggest(received, self.valid_values)
         self.nearest_match = nearest_match
         self.hint = hint

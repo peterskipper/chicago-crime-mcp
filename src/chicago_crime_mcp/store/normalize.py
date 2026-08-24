@@ -26,12 +26,15 @@ Docstrings follow the Google Python style.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from functools import cache
 from typing import Literal
 
 #: Geography dimension. ``citywide`` means no geography column at all -- for the
 #: rollups it selects the dimensionless table, and for a row query it means no
 #: geography predicate. It is never a filter value.
-Geography = Literal["citywide", "beat", "district", "community_area", "ward"]
+Geography = Literal[
+    "citywide", "beat", "district", "community_area", "neighborhood", "ward"
+]
 
 #: Which offense taxonomy to filter and group by. ``source`` reports what the
 #: city called it; ``comparable`` reports the curated stable category, which is
@@ -59,12 +62,22 @@ GEO_COLUMN: dict[Geography, str | None] = {
     "beat": "beat",
     "district": "district",
     "community_area": "community_area",
+    "neighborhood": "neighborhood",
     "ward": "ward",
 }
 
-#: Geographies stored as zero-padded text, with their widths. The rest
-#: (``ward``, ``community_area``) are integers and are coerced as such.
+#: Geographies stored as zero-padded text, with their widths. ``ward`` and
+#: ``community_area`` are integers and are coerced as such.
 PADDED_GEOGRAPHIES: dict[str, int] = {"beat": 4, "district": 3}
+
+#: Geographies stored as free text, where the stored spelling is the only form
+#: the column will match. Every other geography is a code -- an integer or a
+#: zero-padded string -- so coercing it is arithmetic. A neighborhood is a name
+#: someone typed, and names carry case, spacing and punctuation: ``Little Italy,
+#: UIC``, ``O'Hare``, ``Rush & Division``. Matching one has to go through a
+#: normalized key and come back out as the exact stored string, or the predicate
+#: carries the caller's spelling into SQL and returns a confident empty page.
+TEXT_GEOGRAPHIES: frozenset[str] = frozenset({"neighborhood"})
 
 
 def normalize_types(types: Iterable[str]) -> tuple[str, ...]:
@@ -103,6 +116,8 @@ def normalize_geography_values(
     """
     if geography == "citywide":
         return ()
+    if geography in TEXT_GEOGRAPHIES:
+        return tuple(_stored_spelling(str(v)) for v in values)
     width = PADDED_GEOGRAPHIES.get(geography)
     if width is not None:
         return tuple(str(v).strip().zfill(width) for v in values)
@@ -113,3 +128,53 @@ def normalize_geography_values(
         except ValueError as exc:
             raise ValueError(f"{geography} must be an integer, got {value!r}") from exc
     return tuple(coerced)
+
+
+@cache
+def _neighborhood_spellings() -> dict[str, str]:
+    """Map a normalized lookup key to the stored spelling of each neighborhood.
+
+    Cached for the life of the process, which is correct here and would not be
+    for the offense categories or the geography value lists: those come from the
+    data and change when the nightly rollup lands, whereas these 98 names come
+    from a git-tracked boundary file and change only when someone edits the repo.
+
+    Imported lazily because this module is on every store's import path and most
+    callers never touch a neighborhood.
+
+    Returns:
+        A ``match_key -> stored spelling`` map for the 98 named neighborhoods.
+    """
+    from chicago_crime_mcp.geo.resolve import NeighborhoodIndex, match_key
+
+    return {match_key(name): name for name in NeighborhoodIndex.load().names}
+
+
+def _stored_spelling(value: str) -> str:
+    """Return the stored spelling of a neighborhood, or the value untouched.
+
+    Only case and spacing are reconciled -- ``wicker  PARK`` is the same filter
+    as ``Wicker Park``, in the same way ``burglary`` is the same filter as
+    ``BURGLARY``. It deliberately does **not** apply the curated aliases or the
+    containing-area fallbacks: ``Pilsen`` has no polygon and resolves to a
+    *community area*, which is a different geography and therefore a different
+    argument, not something a value coercion can quietly substitute. Turning a
+    colloquial name into a filter is
+    :mod:`~chicago_crime_mcp.geo.resolve`'s job, reached through the
+    ``resolve_neighborhood`` tool.
+
+    An unrecognized name is returned unchanged rather than rejected here, so the
+    caller's own value reaches the vocabulary check and comes back in a teaching
+    error that lists what does exist -- a better answer than anything this
+    function knows how to say.
+
+    Args:
+        value: A neighborhood name as supplied.
+
+    Returns:
+        The stored spelling if the name is one of the 98, else ``value``
+        unchanged.
+    """
+    from chicago_crime_mcp.geo.resolve import match_key
+
+    return _neighborhood_spellings().get(match_key(value), value)

@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from chicago_crime_mcp.server.errors import InvalidArgumentError, UnknownValueError
 from chicago_crime_mcp.server.vocabulary import Vocabulary
 from chicago_crime_mcp.store.normalize import (
+    TEXT_GEOGRAPHIES,
     Geography,
     Taxonomy,
     normalize_geography_values,
@@ -122,14 +123,25 @@ def validated_geography_values(
     valid = vocabulary.values_for(geography)
     unknown = [v for v in normalized if v not in set(valid)]
     if unknown:
+        # A free-text geography gets no fuzzy suggestion. Its set is the names
+        # that have boundaries, not the names people use, so a miss is usually a
+        # real place that is absent -- and difflib answers those with a
+        # confidently wrong neighbour. See errors.NEAREST_CUTOFF.
+        free_text = geography in TEXT_GEOGRAPHIES
         raise UnknownValueError(
             f"{len(unknown)} {geography} value(s) do not occur in the data.",
             field="geography_values",
             received=unknown[0] if len(unknown) == 1 else unknown,
             valid_values=tuple(str(v) for v in valid),
+            suggest_nearest=not free_text,
             hint=(
-                f"Values for geography='{geography}' are matched in their stored form; "
-                "describe_schema lists every one that occurs."
+                "Many well-known Chicago neighborhoods have no boundary of their own "
+                "and are not in this list. Call resolve_neighborhood with the name to "
+                "get the right filter -- it will say whether the answer is an exact "
+                "neighborhood or the broader community area containing it."
+                if free_text
+                else f"Values for geography='{geography}' are matched in their stored "
+                "form; describe_schema lists every one that occurs."
             ),
         )
     return normalized
