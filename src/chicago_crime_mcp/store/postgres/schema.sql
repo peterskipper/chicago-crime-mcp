@@ -119,33 +119,33 @@ CREATE INDEX IF NOT EXISTS incidents_ptc_date_idx
 CREATE INDEX IF NOT EXISTS incidents_stable_date_idx
     ON incidents (stable_category, date DESC, id DESC);
 
--- neighborhood gets the same treatment, and the reasoning above is why: it is
--- the same predicate-plus-keyset shape, so the index has to satisfy the filter
--- AND deliver the sort order for the planner to stop after n rows.
+-- neighborhood gets the same treatment, for the reason given above: same
+-- predicate-plus-keyset shape, so the index has to satisfy the filter AND
+-- deliver the sort order for the planner to stop after n rows.
 --
 -- This was expected NOT to be worth building, by analogy to community_area
--- below. Measured, it is the single largest index win in the schema. The
--- analogy failed because what matters is not how many distinct values a column
--- has, but how many rows match INSIDE the requested date window -- and a small
--- neighborhood inside one year is a far thinner slice than any community area.
---
--- Museum Campus (1,756 rows of 2.9M), the tool's real query shape:
---
---                     no index              with this index
---   2025          19.24 ms / 68,659 buf     0.14 ms /   188 buf
---   last 90 days   8.38 ms / 34,044 buf     0.04 ms /    50 buf
---   all 11 years  11.90 ms / 34,825 buf     8.85 ms / 34,825 buf  (ignored)
+-- below. Measured, it is the biggest index win in the schema -- two orders of
+-- magnitude on a selective neighborhood over a one-year window, and the analogy
+-- was simply wrong. What decides it is not how many distinct values a column
+-- has, but how many rows match INSIDE the requested date window, and a small
+-- neighborhood within one year is a far thinner slice than any community area
+-- over the same span.
 --
 -- Without it the plan is an Index Scan Backward on incidents_date_idx that
--- discards 77,338 rows by filter to find 51, touching 75% of the heap for one
--- page of results. With it, an Index Scan that stops at 51. Stable across
--- repeated ANALYZE, and every neighborhood -- rarest, median and most common --
--- lands under 2 ms. Costs ~139 MB, in line with the two indexes above.
+-- discards tens of thousands of rows by filter to return one page of 51 --
+-- reading most of the heap to do it. With it, an index scan that stops at 51.
+-- The size is in line with the two indexes above.
 --
--- The wide-span case is genuinely marginal: over all 11 years the planner flips
--- between using and ignoring this index across ANALYZE runs, because walking
--- date backwards finds 51 matches soon enough either way. That is fine. It is
--- also not the query anyone asks.
+-- Two caveats worth keeping. A bare (neighborhood) index is NOT a cheaper
+-- substitute despite being far smaller: it only supports a bitmap scan plus a
+-- sort, so it reads every matching row in the span before it can return a page.
+-- And over the widest spans this index is marginal -- the planner flips between
+-- using and ignoring it across ANALYZE runs, because walking date backwards
+-- finds 51 matches soon enough either way. That is fine; it is not the query
+-- anyone asks.
+--
+-- `python scripts/explain_query.py` reproduces the whole comparison on your own
+-- machine, which is why no millisecond figures are pinned here.
 CREATE INDEX IF NOT EXISTS incidents_hood_date_idx
     ON incidents (neighborhood, date DESC, id DESC);
 
@@ -158,11 +158,10 @@ CREATE INDEX IF NOT EXISTS incidents_hood_date_idx
 -- Re-measured when neighborhood was added, because the original explanation --
 -- "these columns are low-cardinality" -- turned out to be the wrong reason for
 -- the right conclusion. A bare (community_area) index is still ignored on both
--- an 11-year and a one-year span, so the conclusion holds. But it does help the
--- narrow one: on a 90-day window, community area 9 goes 8.78 ms / 34,044 buf to
--- 1.36 ms / 122 buf. Not built, because that is one span of one shape and 20 MB
--- is not free -- but it is a real effect, so the note now says so rather than
--- implying cardinality settles it.
+-- an 11-year and a one-year span, so the conclusion holds. But it does help a
+-- 90-day window, by roughly the margin neighborhood shows, so cardinality is not
+-- what settles it. Left unbuilt: one span of one shape does not earn the space.
+-- Re-check with scripts/explain_query.py before assuming either way.
 --
 -- A bare (date DESC, id DESC) was similarly not worth its size --
 -- `incidents_date_idx` plus an Incremental Sort covers that shape already.

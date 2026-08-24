@@ -546,6 +546,49 @@ is what a fresh backfill would have written, and it reports per-column change
 counts before writing anything — a re-run with nothing to do says so. Reload the
 stores afterwards (`chicago-crime-load` then `chicago-crime-rollup`).
 
+### Measuring a query, and deciding about an index
+
+Every "we measured it" claim in `store/postgres/schema.sql` came from
+`scripts/explain_query.py`. It exists so those comments can explain *why* a plan
+is fast or slow without freezing millisecond figures into a file where they rot —
+when you want numbers, run it and get today's numbers on your machine.
+
+```bash
+python scripts/explain_query.py          # worked example: the neighborhood index decision
+
+python scripts/explain_query.py     --sql "SELECT id FROM incidents WHERE ward = %s AND date >= %s AND date < %s            ORDER BY date DESC, id DESC LIMIT 51"     --param 42 --param '"2025-01-01"' --param '"2026-01-01"'     --index "(ward, date DESC, id DESC)"
+```
+
+It runs the query under `EXPLAIN (ANALYZE, BUFFERS)` several times, builds each
+candidate index, measures again, and drops it. `--drop NAME` measures without an
+index that already exists — how you re-ask a question you have already answered.
+`--trials N` rebuilds a candidate repeatedly to check the planner's choice is
+stable rather than sitting on a cost crossover.
+
+Four things the tool is built around, which are most of what there is to know:
+
+- **Read buffers, not milliseconds.** A buffer is one 8 KB page touched. It is a
+  property of the plan and barely moves between runs, while milliseconds depend
+  on your cache and your disk. Two queries at the same wall time touching 200 and
+  68,000 pages are not equally good — the second is fine only while everything
+  fits in RAM.
+- **`rows_removed_by_filter` is the tell.** It counts rows fetched and thrown
+  away. Returning 51 rows after discarding 77,000 means the index that query
+  wants does not exist, or the planner declined to use it.
+- **Measure the span people actually ask for.** The biggest trap, and the one
+  that nearly produced the wrong answer for `neighborhood`: an index can look
+  worthless over eleven years and be worth two orders of magnitude over one,
+  because what decides it is how many rows match *inside the date window*.
+- **Prefer a composite that also delivers the sort order.** For
+  `WHERE x = ? ORDER BY date DESC, id DESC LIMIT n`, an index on
+  `(x, date DESC, id DESC)` lets the planner stop after n rows. A bare `(x)` only
+  supports a bitmap scan plus a sort, so it reads every matching row in the span
+  first — often much worse despite being much smaller.
+
+The module docstring carries the longer version, including why the connection
+sets `prepare_threshold=None` and why parameters and literals can produce
+different plans.
+
 ### Running the tests
 
 ```bash
