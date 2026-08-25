@@ -16,11 +16,43 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError as FastMCPToolError
+from fastmcp.server.middleware import Middleware
+from pydantic import BaseModel
 
 from chicago_crime_mcp.server import tools
-from chicago_crime_mcp.server.app import TOOLS, ToolErrorTelemetryMiddleware, create_app
+from chicago_crime_mcp.server.app import TOOLS, create_app
+from chicago_crime_mcp.server.envelope import ResultWarning, RouteInfo, ToolResult
 from chicago_crime_mcp.server.errors import UnknownValueError
+from chicago_crime_mcp.telemetry.middleware import CallTelemetryMiddleware
+from tests.helpers import RecordingSink
+
+
+class _Payload(BaseModel):
+    """A stand-in payload for the envelope tests."""
+
+    note: str = "x"
+
+
+class _Filters(BaseModel):
+    """A stand-in filter echo for the envelope tests."""
+
+    where: str = "x"
+
+
+#: The real envelope, parametrized. Using ``ToolResult`` rather than a lookalike
+#: is the point of these tests: the middleware's claim is that it can read *this*
+#: shape, and a hand-rolled model with the same field names would still pass if
+#: the envelope changed underneath it.
+Envelope = ToolResult[_Payload, _Filters]
+
+
+def _envelope(**kwargs) -> Envelope:
+    """Build an envelope, filling the fields these tests do not care about."""
+    kwargs.setdefault("data", _Payload())
+    kwargs.setdefault("filters_applied", _Filters())
+    return Envelope(**kwargs)
 
 
 @pytest.fixture(scope="module")
@@ -158,59 +190,122 @@ def test_rendered_message_survives_as_the_exception_string():
     assert "Valid values" in rendered
 
 
-def _run(middleware, call_next):
-    """Drive the middleware once with a stubbed call chain."""
+def test_a_teaching_error_reaches_middleware_as_our_own_class():
+    """The load-bearing fact behind every error record, driven end to end.
 
-    class _Message:
-        name = "aggregate_incidents"
+    FastMCP catches a tool's exception *below* the middleware chain, which is
+    why an earlier boundary translation in this project was dead code. What
+    makes the telemetry path live instead is that our ``ToolError`` subclasses
+    FastMCP's, so FastMCP re-raises it rather than wrapping it, and the
+    structured fields survive to be logged.
 
-    class _Context:
-        message = _Message()
+    That is a claim about FastMCP's behaviour, so a stubbed ``call_next`` cannot
+    check it -- a stub would pass no matter what the framework did. This drives
+    a real server through a real client.
+    """
+    sink = RecordingSink()
+    seen = {}
 
-    return asyncio.run(middleware.on_call_tool(_Context(), call_next))
+    class Capture(Middleware):
+        async def on_call_tool(self, context, call_next):
+            try:
+                return await call_next(context)
+            except Exception as exc:
+                seen["exc"] = exc
+                raise
 
+    app = FastMCP(name="probe")
+    app.add_middleware(CallTelemetryMiddleware(sink=sink))
+    app.add_middleware(Capture())
 
-def test_middleware_logs_the_structured_form(caplog):
-    """The fields are logged before the wire flattens them into a string."""
-
-    async def call_next(_context):
+    @app.tool
+    def picky(types: str) -> dict:
+        """A tool that rejects its argument."""
         raise UnknownValueError(
-            "no such category.", field="types", received="BATERY",
-            valid_values=("BATTERY", "THEFT"),
+            "no such category.", field="types", received=types, valid_values=("BATTERY", "THEFT")
         )
 
-    with caplog.at_level("INFO", logger="chicago_crime_mcp.server.app"):
-        with pytest.raises(UnknownValueError):
-            _run(ToolErrorTelemetryMiddleware(), call_next)
-    record = next(r for r in caplog.records if "tool error" in r.getMessage())
-    assert "'field': 'types'" in record.getMessage()
-    assert "'code': 'unknown_value'" in record.getMessage()
+    async def call():
+        async with Client(app) as client:
+            await client.call_tool("picky", {"types": "BATERY"})
+
+    with pytest.raises(FastMCPToolError):
+        asyncio.run(call())
+
+    assert isinstance(seen["exc"], UnknownValueError), (
+        "FastMCP wrapped our error instead of re-raising it; the telemetry "
+        "middleware's except-clause would be dead code"
+    )
+    assert seen["exc"].details()["field"] == "types"
+
+    record = sink.only
+    assert (record.tool, record.outcome) == ("picky", "error")
+    assert (record.error_code, record.error_field) == ("unknown_value", "types")
+    assert record.error_received == "BATERY"
+    assert record.error_nearest_match == "BATTERY"
 
 
-def test_middleware_re_raises_unchanged(caplog):
-    """It observes; it must not alter what the caller receives."""
-    error = UnknownValueError("no such category.", field="types")
+def test_a_successful_call_is_recorded_from_the_serialized_envelope():
+    """The middleware reads the response, so no tool reports anything twice."""
+    sink = RecordingSink()
+    app = FastMCP(name="probe")
+    app.add_middleware(CallTelemetryMiddleware(sink=sink))
 
-    async def call_next(_context):
-        raise error
+    @app.tool
+    def counted() -> Envelope:
+        """A tool returning an envelope-shaped result."""
+        return _envelope(
+            row_count=3,
+            truncated=True,
+            cursor="abc",
+            taxonomy_mode="comparable",
+            route=RouteInfo(
+                store="duckdb", tier="rollup", table="monthly", reason="x", elapsed_ms=1.5
+            ),
+            warnings=[ResultWarning(code="provisional", message="m")],
+        )
 
-    with pytest.raises(UnknownValueError) as exc:
-        _run(ToolErrorTelemetryMiddleware(), call_next)
-    assert exc.value is error
+    async def call():
+        async with Client(app) as client:
+            await client.call_tool("counted", {})
+
+    asyncio.run(call())
+
+    record = sink.only
+    assert record.outcome == "ok"
+    assert (record.row_count, record.truncated, record.cursor_issued) == (3, True, True)
+    assert (record.route_store, record.route_tier, record.route_table) == (
+        "duckdb",
+        "rollup",
+        "monthly",
+    )
+    assert record.route_elapsed_ms == 1.5
+    assert record.taxonomy_mode == "comparable"
+    assert record.warning_codes == ["provisional"]
+    # Measured, not echoed: the envelope carries no size, so this is the
+    # middleware serializing the response it actually saw.
+    assert record.result_bytes > 0
+    assert record.duration_ms > 0
 
 
-def test_middleware_passes_a_successful_call_through():
-    async def call_next(_context):
-        return "result"
+def test_an_empty_result_is_recorded_as_empty_not_ok():
+    """'Valid filters, nothing matched' is the signal; it must not read as success."""
+    sink = RecordingSink()
+    app = FastMCP(name="probe")
+    app.add_middleware(CallTelemetryMiddleware(sink=sink))
 
-    assert _run(ToolErrorTelemetryMiddleware(), call_next) == "result"
+    @app.tool
+    def nothing() -> Envelope:
+        """A tool whose filters matched no rows."""
+        return _envelope(
+            row_count=0,
+            route=RouteInfo(store="postgres", reason="x", elapsed_ms=1.0),
+            warnings=[ResultWarning(code="empty_result", message="m")],
+        )
 
+    async def call():
+        async with Client(app) as client:
+            await client.call_tool("nothing", {})
 
-def test_middleware_does_not_touch_unrelated_errors():
-    """An operational bug must not be dressed up as a bad argument."""
-
-    async def call_next(_context):
-        raise RuntimeError("something broke")
-
-    with pytest.raises(RuntimeError):
-        _run(ToolErrorTelemetryMiddleware(), call_next)
+    asyncio.run(call())
+    assert sink.only.outcome == "empty"

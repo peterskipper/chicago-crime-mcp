@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pyarrow as pa
@@ -184,3 +185,43 @@ class StubLocator:
     def __exit__(self, *exc: object) -> None:
         """Exit the context manager, closing the locator."""
         self.close()
+
+
+class RecordingSink:
+    """A telemetry sink that keeps records in memory instead of on disk.
+
+    Stands in for :class:`~chicago_crime_mcp.telemetry.sink.TelemetrySink`
+    wherever a test cares about *what* was recorded rather than how it was
+    written. The file format is
+    :mod:`tests.test_telemetry_sink`'s subject, not everyone else's.
+
+    Attributes:
+        records: Every record written, in order.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty sink."""
+        self.records: list[Any] = []
+
+    def write(self, record: Any) -> None:
+        """Keep one record.
+
+        Args:
+            record: The :class:`~chicago_crime_mcp.telemetry.record.CallRecord`.
+        """
+        self.records.append(record)
+
+    @property
+    def only(self) -> Any:
+        """The single record written.
+
+        Returns:
+            The one record.
+
+        Raises:
+            AssertionError: If the count is not exactly one -- which is itself
+                the assertion most callers want, since a middleware that logs
+                twice or not at all is a bug either way.
+        """
+        assert len(self.records) == 1, f"expected 1 record, got {len(self.records)}"
+        return self.records[0]
