@@ -350,18 +350,50 @@ def test_invention_is_still_caught_among_real_figures():
     assert "9912" in results[0].detail
 
 
-def test_a_long_series_is_not_scanned_pairwise():
-    """Guards the loosening from becoming vacuous.
-
-    With enough values almost any number is reachable by some pair, so the
-    pairwise scan is capped -- otherwise the check would pass everything.
-    """
-    long_series = list(range(checks.MAX_SERIES + 20))
+def test_a_whole_series_total_is_grounded_however_long_the_series():
+    """A category-by-month result runs to hundreds of rows and is still summable."""
+    long_series = [7 + (i % 13) for i in range(300)]
     transcript = _transcript(
         calls=[("aggregate_incidents", {}, True, _buckets(long_series))],
-        answer="There were 8,675,309 offenses.",
+        answer=f"There were {sum(long_series):,} offenses.",
     )
-    assert not _passed(checks.grounded_numbers(transcript, True))
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_totals_from_two_separate_calls_can_be_differenced():
+    """'7,052 in 2016 and 6,828 in 2024, a fall of 224' spans two calls."""
+    a, b = [100, 200, 300], [100, 200, 176]
+    transcript = _transcript(
+        calls=[
+            ("aggregate_incidents", {}, True, _buckets(a)),
+            ("aggregate_incidents", {}, True, _buckets(b)),
+        ],
+        answer=f"{sum(a)} then {sum(b)}, a fall of {sum(a) - sum(b)}.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_a_long_series_does_not_make_every_figure_derivable():
+    """The measurement that set MAX_SERIES, pinned so it cannot regress.
+
+    Allowing window and pairwise scans over a long series accepted 100% of
+    random three-digit figures against a real 236-bucket result -- which is not
+    a check, it is decoration. Restricting those scans to the length of a real
+    period series brought it to roughly one in eleven.
+    """
+    import random
+
+    long_series = [7 + (i % 13) for i in range(300)]
+    result = _buckets(long_series)
+    random.seed(0)
+    accepted = 0
+    for _ in range(300):
+        answer = str(random.randint(1000, 9999))
+        transcript = _transcript(
+            calls=[("aggregate_incidents", {}, True, result)], answer=answer
+        )
+        accepted += _passed(checks.grounded_numbers(transcript, True))
+    assert accepted <= 30, f"{accepted}/300 random figures accepted -- the check is decoration"
 
 
 # --- the case file -----------------------------------------------------------

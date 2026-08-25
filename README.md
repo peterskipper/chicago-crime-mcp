@@ -453,6 +453,38 @@ none". That is a test of the error path, not of the column.
 The general rule: **if the column changes what the model must decide, evaluate
 it; if it changes what the model is handed, unit-test it.**
 
+#### `grounded_numbers`, and why its limits are the design
+
+The check that a figure in the answer came from the data is the only guard
+against a hallucinated number, and it is the one that took the most tuning —
+worth recording, because both failure directions were reached by measurement
+rather than by reasoning.
+
+Demanding a **verbatim** match failed correct answers: a model that sums six
+monthly buckets into a total, or reports a difference or a percentage, cites a
+figure that appears in no result. Against a real run that produced eight of nine
+failures and buried every other signal in the suite.
+
+Allowing **any contiguous-window sum** overcorrected. Fired at a real 236-bucket
+result — one ward-year broken down by category — it accepted **100% of random
+three-digit figures and 65% of four-digit ones**. A window scan over a long
+series produces tens of thousands of candidates and blankets the range, which is
+decoration rather than a check.
+
+What it settled on, and why each limit is where it is:
+
+| Route | Allowed on | Why |
+|---|---|---|
+| Exact match | any figure the model was handed, including digit runs inside strings | codes, years inside dates, and numbers quoted from a warning message were all read by the model |
+| Whole-series total | a series of any length | one candidate value per series — a specific claim |
+| Difference / percentage **between totals** | always | how "7,052 in 2016 and 6,828 in 2024, a fall of 224" is reached, across two calls |
+| Window sums, pairwise scans over raw values | series of ≤ 24 values | the length of a real period series, not a category cross-product |
+
+Measured after tightening: random figures are rejected about 91% of the time at
+three digits and essentially always at four or more, while every real derivation
+above passes. A test pins the false-accept rate so the check cannot quietly
+become decoration again.
+
 The checks are pure functions over a transcript and import no SDK, so the whole
 vocabulary is unit-tested offline and runs in `make ci` with no API key. That
 covers the two things most likely to be quietly wrong — a check that does not

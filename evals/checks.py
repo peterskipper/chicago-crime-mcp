@@ -30,10 +30,13 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: correct answer.
 MIN_GROUNDED_DIGITS = 3
 
-#: Series longer than this are skipped by the pairwise part of
-#: :func:`_derivable`. The scan is quadratic, and a long series makes almost any
-#: number reachable -- both reasons point the same way.
-MAX_SERIES = 60
+#: Longest series :func:`_derivable` will scan for windows or pairs. Sized to a
+#: real period series -- two years of monthly buckets -- rather than to a
+#: category cross-product, which for one ward-year is already 236 rows. Measured:
+#: allowing those scans on a 236-row series accepted 100% of random three-digit
+#: figures. A whole-series *total* is exempt from this limit, being one specific
+#: value rather than tens of thousands.
+MAX_SERIES = 24
 
 
 @dataclass(frozen=True)
@@ -112,47 +115,56 @@ class Transcript:
         """Return the figures a model could have read, and how they group.
 
         Two shapes, because grounding needs both. The flat set answers "was this
-        number handed to the model at all". The per-key series answer "could the
-        model have *computed* it" -- summing a column of monthly buckets into a
-        total is the single commonest thing a correct answer does, and it is
-        indistinguishable from invention unless the series is kept intact.
+        number handed to the model at all". The series answer "could the model
+        have *computed* it" -- summing a column of buckets into a total is the
+        commonest thing a correct answer does, and is indistinguishable from
+        invention unless the series is kept intact.
+
+        **Series are per call, not merged across calls**, which was a real bug:
+        a question about ward 3 in 2016 and 2024 is two calls, and merging their
+        monthly buckets made the total 13,880 rather than the 7,052 and 6,828
+        the model correctly reported.
 
         Only successful calls contribute: a figure cited out of an error message
         is not a sourced figure.
 
         Returns:
             A ``(all_values, series)`` pair, where ``series`` holds one list per
-            repeated key across the result structures.
+            repeated key per call.
         """
         flat: set[float] = set()
-        series: dict[str, list[float]] = {}
-
-        def walk(node: Any, key: str) -> None:
-            if isinstance(node, bool):
-                return
-            if isinstance(node, (int, float)):
-                flat.add(float(node))
-                series.setdefault(key, []).append(float(node))
-            elif isinstance(node, str):
-                # Every digit run inside a string counts as handed to the model,
-                # not just wholly-numeric strings. Three kinds of figure arrive
-                # this way and all three are legitimately quotable: zero-padded
-                # districts and IUCR codes ("018", "0325"), the year inside a
-                # period ("2016-01-01"), and the numbers written into a warning
-                # message, which the model read along with everything else.
-                for run in _digits(node):
-                    flat.add(float(run))
-            elif isinstance(node, dict):
-                for k, v in node.items():
-                    walk(v, k)
-            elif isinstance(node, list):
-                for item in node:
-                    walk(item, key)
+        all_series: list[list[float]] = []
 
         for call in self.calls:
-            if call.ok:
-                walk(call.result, "")
-        return flat, list(series.values())
+            if not call.ok:
+                continue
+            series: dict[str, list[float]] = {}
+
+            def walk(node: Any, key: str, series: dict[str, list[float]] = series) -> None:
+                if isinstance(node, bool):
+                    return
+                if isinstance(node, (int, float)):
+                    flat.add(float(node))
+                    series.setdefault(key, []).append(float(node))
+                elif isinstance(node, str):
+                    # Every digit run inside a string counts as handed to the
+                    # model, not just wholly-numeric strings. Three kinds arrive
+                    # this way and all are legitimately quotable: zero-padded
+                    # districts and IUCR codes ("018", "0325"), the year inside
+                    # a period ("2016-01-01"), and numbers written into a
+                    # warning message, which the model read with everything else.
+                    for run in _digits(node):
+                        flat.add(float(run))
+                elif isinstance(node, dict):
+                    for k, v in node.items():
+                        walk(v, k, series)
+                elif isinstance(node, list):
+                    for item in node:
+                        walk(item, key, series)
+
+            walk(call.result, "")
+            all_series.extend(series.values())
+        return flat, all_series
 
 
 @dataclass(frozen=True)
@@ -476,34 +488,92 @@ def grounded_numbers(transcript: Transcript, _spec: bool) -> list[CheckResult]:
 def _derivable(target: float, series: Sequence[Sequence[float]]) -> bool:
     """Return whether a figure follows from one of the result's own series.
 
-    Covers the three operations a data answer actually performs: a total, a
-    change between two periods, and that change as a percentage. Deliberately
-    not a general search for any arithmetic that reaches the number -- with
-    enough values that succeeds for almost anything, and a check that passes
-    everything is not a check.
+    Covers what a data answer actually computes: a total, a total over part of a
+    period series, a change between two totals, and a change as a percentage.
+
+    **The limits here are the whole design, and they were set by measurement.**
+    An earlier version allowed contiguous-window sums over any series; fired at a
+    real 236-bucket result it accepted *100% of random three-digit figures and
+    65% of four-digit ones*. A window scan over a long series produces tens of
+    thousands of candidate values and blankets the range, which turns the check
+    into decoration. So:
+
+    * a **whole-series total** is allowed on any length -- it is one candidate
+      value per series, which is a specific claim;
+    * **totals are then related to each other** by difference and percentage,
+      which is how "7,052 in 2016 and 6,828 in 2024, a fall of 224" is reached
+      across two calls, and there are only a handful of totals;
+    * **window sums and pairwise scans over raw values** are restricted to short
+      series, the length of a real period series rather than a category
+      cross-product.
 
     Args:
         target: The figure from the answer.
-        series: One list of values per repeated key in the results.
+        series: One list of values per repeated key per call.
 
     Returns:
-        True if some series totals to it, or two of its values differ by it, or
-        relate to it as a percentage.
+        True if some series reaches it by one of those routes.
     """
+    totals = [sum(values) for values in series if values]
+    if any(_close(total, target) for total in totals):
+        return True
+    if _related(target, totals):
+        return True
     for values in series:
-        if not values or len(values) > MAX_SERIES:
+        if len(values) < 2 or len(values) > MAX_SERIES:
             continue
-        if _close(sum(values), target):
+        if _window_sum(values, target):
             return True
-        for a in values:
-            for b in values:
-                if _close(abs(a - b), target):
-                    return True
-                if b and (
-                    _close(round(abs(a - b) / b * 100), target)
-                    or _close(round(a / b * 100), target)
-                ):
-                    return True
+        if _related(target, values):
+            return True
+    return False
+
+
+def _related(target: float, values: Sequence[float]) -> bool:
+    """Return whether two of the values differ by the figure, or relate as a percentage.
+
+    Args:
+        target: The figure from the answer.
+        values: Candidate values.
+
+    Returns:
+        True if some pair reaches it.
+    """
+    if len(values) > MAX_SERIES:
+        return False
+    for a in values:
+        for b in values:
+            if _close(abs(a - b), target):
+                return True
+            if b and (
+                _close(round(abs(a - b) / b * 100), target)
+                or _close(round(a / b * 100), target)
+            ):
+                return True
+    return False
+
+
+def _window_sum(values: Sequence[float], target: float) -> bool:
+    """Return whether any run of consecutive values totals the figure.
+
+    "Thefts over the last six months" out of a twelve-month series, or one year
+    out of two. Runs of length one are skipped -- a single value is already
+    covered by the exact-match set, and allowing them here would let any
+    returned number satisfy any other check by accident.
+
+    Args:
+        values: One series, in the order returned.
+        target: The figure from the answer.
+
+    Returns:
+        True if a contiguous run sums to it.
+    """
+    for start in range(len(values)):
+        running = 0.0
+        for end in range(start, len(values)):
+            running += values[end]
+            if end > start and _close(running, target):
+                return True
     return False
 
 
