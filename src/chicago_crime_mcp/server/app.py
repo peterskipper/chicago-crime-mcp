@@ -1,4 +1,4 @@
-"""The FastMCP application: lifespan, tool registration, error telemetry.
+"""The FastMCP application: lifespan, tool registration, middleware.
 
 Three jobs, and only three -- everything else lives in the modules this wires
 together.
@@ -14,14 +14,15 @@ tool's schema from its signature and its description from its docstring, which
 is why those docstrings are written for a model to act on rather than for a
 developer to skim.
 
-**Error telemetry, not error translation.** Our errors reach the model intact
-because :class:`~chicago_crime_mcp.server.errors.ToolError` subclasses FastMCP's
-own, not because anything here converts them: FastMCP catches a tool's exception
-*below* the middleware chain, so a boundary translation would never run. (It was
-written that way first, and was dead code.) The middleware records the
-structured fields before the wire flattens them into text, which is where the
-telemetry questions -- which values the model invents, which argument it gets
-wrong -- are actually answerable.
+**Telemetry, not error translation.** Our errors reach the model intact because
+:class:`~chicago_crime_mcp.server.errors.ToolError` subclasses FastMCP's own, not
+because anything here converts them: FastMCP catches a tool's exception *below*
+the middleware chain, so a boundary translation would never run. (It was written
+that way first, and was dead code.) What the middleware does instead is record
+every call -- arguments in, route and outcome out -- while the fields are still
+structured, before the wire flattens them into text. That lives in
+:class:`~chicago_crime_mcp.telemetry.middleware.CallTelemetryMiddleware`; this
+module only wires it in.
 
 Docstrings follow the Google Python style.
 """
@@ -33,21 +34,17 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
 
 from fastmcp import FastMCP
-from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from chicago_crime_mcp.server.context import ServerContext, set_context
-from chicago_crime_mcp.server.errors import ToolError
 from chicago_crime_mcp.server.tools.aggregate_incidents import aggregate_incidents
 from chicago_crime_mcp.server.tools.describe_schema import describe_schema
 from chicago_crime_mcp.server.tools.get_incident import get_incident
 from chicago_crime_mcp.server.tools.nearby_incidents import nearby_incidents
 from chicago_crime_mcp.server.tools.resolve_neighborhood import resolve_neighborhood
 from chicago_crime_mcp.server.tools.search_incidents import search_incidents
-
-log = logging.getLogger(__name__)
+from chicago_crime_mcp.telemetry.middleware import CallTelemetryMiddleware
 
 #: What the server tells a client it is for. Read before any tool is called, so
 #: it is the first chance to steer a question to the right tool.
@@ -92,46 +89,6 @@ TOOLS = (
 )
 
 
-class ToolErrorTelemetryMiddleware(Middleware):
-    """Log the structured form of every teaching error, then re-raise it.
-
-    Translation is **not** done here, and cannot be: FastMCP catches a tool's
-    exception below the middleware chain, so an error raised inside a tool
-    arrives here already wrapped. Our errors subclass FastMCP's ``ToolError``
-    instead, which is what gets the rendered message to the model untouched --
-    see :mod:`chicago_crime_mcp.server.errors`.
-
-    What this *can* do is record the structured fields before they collapse into
-    a string on the wire. "Which enum values does the model invent" and
-    "malformed-arg rate by field" are the telemetry questions this project cares
-    about, and answering them by grepping prose would be miserable. This is the
-    seam Phase 4's per-call logging extends.
-    """
-
-    async def on_call_tool(self, context: MiddlewareContext, call_next: Any) -> Any:
-        """Run the tool, logging a structured record of any teaching error.
-
-        Args:
-            context: The call being made.
-            call_next: The rest of the middleware chain.
-
-        Returns:
-            The tool's result.
-
-        Raises:
-            Exception: Whatever the tool raised, unchanged.
-        """
-        try:
-            return await call_next(context)
-        except ToolError as exc:
-            log.info(
-                "tool error: tool=%s %s",
-                getattr(context.message, "name", "?"),
-                exc.details(),
-            )
-            raise
-
-
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[ServerContext]:
     """Open the store connections for the life of the server.
@@ -164,7 +121,7 @@ def create_app() -> FastMCP:
         instructions=INSTRUCTIONS,
         lifespan=lifespan,
     )
-    app.add_middleware(ToolErrorTelemetryMiddleware())
+    app.add_middleware(CallTelemetryMiddleware())
     for tool in TOOLS:
         app.tool(tool)
     return app
@@ -205,7 +162,6 @@ def main(argv: list[str] | None = None) -> None:
 __all__ = [
     "INSTRUCTIONS",
     "TOOLS",
-    "ToolErrorTelemetryMiddleware",
     "create_app",
     "lifespan",
     "main",

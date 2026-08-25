@@ -233,12 +233,265 @@ by measurement rather than by design:
   changes is that it is paid where nobody is waiting instead of on a caller's
   first question, and again after each nightly swap.
 
-### Observability
-Every tool call is logged as structured JSON (trace id, args, resolved query
-plan, row count, latency, compacted result). A batch job rolls those logs into
-**outcome/failure telemetry** — empty-result rates, `resolve_neighborhood`
-misses, malformed-arg rates — treating failures as the product signal. (The
-server only ever sees structured tool arguments, never the user's raw prompt.)
+### Observability: the envelope is also the telemetry schema
+
+Every tool call is written to a JSON-lines log, one flat object per call. What
+makes that cheap is a property the tool surface already had: **every tool returns
+an envelope** naming which store answered and why, how many rows came back,
+whether the page was capped, and which qualifications applied — because a model
+reading a result it cannot verify needs all of that. Those are the same facts an
+operator needs, so one middleware reads them back out of the serialized response.
+Six tools returning four payload shapes are covered by one extractor, and nothing
+in `server/tools/` knows telemetry exists.
+
+```json
+{"ts": "2026-08-24T18:02:11.417+00:00", "call_id": "9f2c…", "session_id": "s-14",
+ "tool": "aggregate_incidents", "duration_ms": 27.4, "outcome": "ok",
+ "args": {"geography": "community_area", "geography_values": [8], "start": "2024-01-01"},
+ "route_store": "duckdb", "route_tier": "rollup", "route_table": "monthly_rollup",
+ "route_elapsed_ms": 9.1, "row_count": 12, "truncated": false, "cursor_issued": false,
+ "taxonomy_mode": "source", "warning_codes": ["provisional"], "result_bytes": 5602,
+ "resolution_kind": null, "error_code": null}
+```
+
+#### Failures are the signal, and the protocol makes that unavoidable
+
+MCP hands a server **structured arguments and nothing else** — no prompt, no
+conversation, no user. The model does the natural-language parse client-side. So
+"what do people ask about" is not a question this data can answer, and inferring
+it would be invention. What the arguments *do* show is where the surface let a
+model down. `chicago-crime-telemetry` rolls the logs up with DuckDB — six
+reports, all variations on that theme:
+
+| Report | The question it answers |
+|---|---|
+| Calls by tool | Where the traffic is, and how often each tool disappoints |
+| Empty results by filter combination | A combination at 100% has *never* returned a row — a tool description inviting a question the data cannot answer |
+| **`resolve_neighborhood` misses** | The alias backlog, ranked by demand and by distinct sessions |
+| Malformed arguments by field | Which argument the model gets wrong, and what it invents instead |
+| Latency by route | Where the time goes, split by the route actually taken |
+| Warning frequency | A warning on nearly every call has stopped carrying information |
+
+Three details that took some getting right:
+
+- **The alias backlog needs a column of its own.** A `resolve_neighborhood` call
+  for "Bronzeville" *succeeds* — it returns candidates flagged as guesses the
+  model was told not to filter on. Counting errors would miss almost all of it,
+  so `resolution_kind` is recorded per call and a soft miss is as visible as a
+  hard one. The report emits a CSV shaped like `reference/neighborhood_aliases.csv`
+  with the targets **left blank**: deciding what Bronzeville means is a judgement
+  about Chicago, and the job has no business guessing at it.
+- **Three kinds of error, kept apart.** A teaching error is the self-correcting
+  loop working. `schema_validation` means the arguments never matched the
+  published JSON Schema, so the tool was never entered — that points at the
+  schema rather than at the offense vocabulary. `unhandled` is a bug. An error
+  rate that mixes the three is uninterpretable.
+- **Overhead is reported separately from query time.** `duration_ms` covers the
+  whole call and `route_elapsed_ms` only the query; the gap is validation,
+  mapping and envelope construction. A slow serializer and a slow database want
+  opposite fixes, and the tool-level number alone cannot tell them apart.
+
+#### Privacy and retention
+
+The domain is investigative, so what is kept is a decision rather than a default.
+
+- **No prompt is ever captured**, because the server never receives one. Raw
+  natural language would have to be logged in a client layer, with consent — a
+  different system with different obligations.
+- **Arguments are logged verbatim, coordinates included.** A `nearby_incidents`
+  latitude/longitude is the *asker's* area of interest, not a victim's address,
+  and the source data is block-level by design — deriving a specific address
+  from it is prohibited and impossible. Rounding the coordinate would destroy
+  the "which places do we answer badly" signal for no privacy gain.
+- **Retention is a file operation** — one file per day, so enforcing a policy is
+  deleting files, with no lock to take and no space to reclaim afterwards:
+
+  ```bash
+  find data/telemetry -name 'calls-*.jsonl' -mtime +90 -delete   # keep 90 days
+  ```
+
+  Nothing here is written to a database, and this is one of the reasons: the
+  same policy over a table is a `DELETE` plus a `VACUUM`, contending with
+  whatever else holds the database open — and the rollup holds it open. Note
+  that **nothing in this repo runs that command**; the layout makes the policy
+  cheap to enforce, it does not enforce one for you.
+- **Off with one variable** — `TELEMETRY_ENABLED=0` stops the file sink; the
+  one-line stderr summary is independent of it.
+
+```bash
+chicago-crime-telemetry                              # roll up TELEMETRY_LOG_DIR
+chicago-crime-telemetry data/telemetry \
+  --alias-backlog data/alias-backlog.csv             # + the curation stub
+```
+
+### Does any of it work? The eval harness
+
+The five affordances above are claims about how a *model* behaves. Unit tests
+prove each one is implemented; only a real model deciding what to call, reading
+what came back, and answering can show whether any of them work on something
+that has not read this README.
+
+`evals/` runs 19 natural-language questions through the Anthropic API against the
+real server, in-process, and grades **tool-call behaviour** rather than prose:
+which tool was reached for, what went in the arguments, in what order, whether an
+error taught it enough to retry. Each case is tagged with the affordance it is
+trying to break.
+
+The headline case is Bronzeville — a real, well-known Chicago neighborhood with
+no boundary of its own, which `difflib` answers with "Andersonville", 19.4 km
+away at the opposite end of the city, with a plausible number attached. The case
+asserts that `resolve_neighborhood` is called *before* any filter, that the
+answer names the community area it widened to, and that "Andersonville" never
+appears.
+
+Running it needs three things: the `eval` extra installed, the stores the server
+itself needs (a loaded Postgres and a built rollup database), and Anthropic
+credentials — either `ANTHROPIC_API_KEY` in the environment or an `ant auth
+login` profile, which the SDK picks up on its own.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...        # or: ant auth login
+
+python -m evals --preflight                # verify everything but the model, free
+python -m evals --list                     # the cases, without running them
+python -m evals --affordance "entity resolution"   # one group (6 cases)
+python -m evals                            # the full suite — real calls, real money
+python -m evals --json runs/latest.json    # keep the transcripts too
+```
+
+Start with `--preflight`. It checks the cases load, the tool descriptions and
+schemas are published, the stores answer, and a teaching error still carries its
+suggestion — every one of which fails in a way that looks like a bad eval result
+rather than a broken setup. Then run one affordance group before paying for the
+sweep: it is enough to see whether the grading is behaving.
+
+Exit status is 0 when every case that was expected to pass did, so it can gate
+something later if that ever becomes useful.
+
+#### Which model to run it on
+
+`EVAL_MODEL` switches the instrument. The full 22-case suite costs roughly **$4
+on Opus 5**, and about $2 on Sonnet 5 or $0.60 on Haiku 4.5 — the input is
+dominated by ~3.1K tokens of tool definitions resent every turn plus a 3K-token
+`describe_schema` result, so a typical four-turn case sends ~23K input tokens.
+
+Those savings are small enough that cost should not drive the choice. What
+should:
+
+- **Opus 5 (default)** — the baseline. A failure is most likely attributable to
+  the tool surface rather than to the model, which is the whole point of the
+  exercise.
+- **Sonnet 5** — fine for routine re-runs while iterating on a tool description.
+- **Haiku 4.5** — worth running, but as a *different experiment*, not a discount.
+  A weaker model is a more sensitive detector of an under-specified surface: if
+  Opus can infer its way past a vague argument description, the eval passes and
+  the vagueness ships. The affordances exist precisely so a model does not have
+  to be clever — schema discovery so it need not guess, teaching errors so it can
+  self-correct — so a suite that passes on Haiku is a much stronger claim than
+  one that passes on Opus. Note that Haiku 4.5 predates adaptive thinking and
+  runs with **no thinking at all** under this harness, which omits the parameter;
+  that is a real difference in what is being measured, not just a cheaper run.
+
+Scorecards are only comparable within one model, so the model is printed in the
+header and recorded in the `--json` output.
+
+Progress prints to stderr as each case finishes, so the scorecard on stdout
+stays pipeable:
+
+```
+running 22 case(s) on claude-opus-5
+[####....................]  1/22  aggregate-not-list      3/3  3 turns  pass
+[########................]  2/22  schema-before-guessing  4/4  3 turns  pass
+```
+
+A few deliberate choices. It is a **manual tool-use loop**, not the SDK's tool
+runner — the runner is less code and hides the thing being measured, since the
+transcript *is* the grade. A teaching error is handed back to the model as a
+`tool_result` with `is_error`, exactly as an MCP client would, because a harness
+that aborted on the first error would make the teaching-error affordance
+untestable. And there is **no system prompt** beyond one sentence: the server's
+own `INSTRUCTIONS` and tool docstrings are what is under test, so extra guidance
+here would grade a prompt this project does not ship.
+
+#### What belongs in an eval, and what does not
+
+The two normalized offense columns make the line concrete, because they sit on
+opposite sides of it.
+
+**`stable_category` is a decision, so it is evaluated.** It backs the `taxonomy`
+argument, which defaults to `source` and is *never* auto-switched — inferring it
+from the question was rejected in Phase 2. The stakes are as high as they get
+here: measured over the loaded window, citywide burglary 2024 → 2025 reads
+**8,434 → 9,741 under `source` and 7,659 → 6,213 under `comparable`**. Up 15% or
+down 19%, from the same data, decided by an argument the user never sees. Worse,
+nothing warns about it — the coverage-drift warning is bounds-based and fires for
+codes introduced or retired mid-span, while IUCR `0760` is present throughout and
+merely re-grouped. So the model has to arrive at the right taxonomy from
+`describe_schema` and the argument description alone, and whether it does is a
+question only a model can answer. Two cases cover it: one where the question asks
+for a like-for-like comparison, and one where it does not and the answer is
+expected to disclose its basis anyway.
+
+**`primary_type_canonical` is an invariant, so it is not.** CPD spelled the same
+offense `CRIM SEXUAL ASSAULT` for 6,581 rows and `CRIMINAL SEXUAL ASSAULT` for
+11,972, transitioning across 2015–2020. That fold happens **at ingest**, before
+anything is stored, so by the time a model can see the data there is exactly one
+value and no choice to make. An eval grades behaviour; there is no behaviour here
+to grade, and a case asserting "the count is right" could not tell a correct
+answer from a plausible one — `grounded_numbers` only checks that a figure came
+from a tool, not that the tool was right. The instrument that *can* prove this is
+a unit test over the ingest transform, and that is where it lives
+(`tests/test_schema.py`).
+
+One slice of it is genuinely eval-shaped, and has a case: `describe_schema`
+names the retired spelling in its own prose, explaining what was unified. A model
+can read it there and try to filter on it. The teaching error does suggest the
+canonical value — so the case asserts that, however it gets there, the query ends
+up on `CRIMINAL SEXUAL ASSAULT` rather than returning a confident "there were
+none". That is a test of the error path, not of the column.
+
+The general rule: **if the column changes what the model must decide, evaluate
+it; if it changes what the model is handed, unit-test it.**
+
+#### `grounded_numbers`, and why its limits are the design
+
+The check that a figure in the answer came from the data is the only guard
+against a hallucinated number, and it is the one that took the most tuning —
+worth recording, because both failure directions were reached by measurement
+rather than by reasoning.
+
+Demanding a **verbatim** match failed correct answers: a model that sums six
+monthly buckets into a total, or reports a difference or a percentage, cites a
+figure that appears in no result. Against a real run that produced eight of nine
+failures and buried every other signal in the suite.
+
+Allowing **any contiguous-window sum** overcorrected. Fired at a real 236-bucket
+result — one ward-year broken down by category — it accepted **100% of random
+three-digit figures and 65% of four-digit ones**. A window scan over a long
+series produces tens of thousands of candidates and blankets the range, which is
+decoration rather than a check.
+
+What it settled on, and why each limit is where it is:
+
+| Route | Allowed on | Why |
+|---|---|---|
+| Exact match | any figure the model was handed, including digit runs inside strings | codes, years inside dates, and numbers quoted from a warning message were all read by the model |
+| Whole-series total | a series of any length | one candidate value per series — a specific claim |
+| Difference / percentage **between totals** | always | how "7,052 in 2016 and 6,828 in 2024, a fall of 224" is reached, across two calls |
+| Window sums, pairwise scans over raw values | series of ≤ 24 values | the length of a real period series, not a category cross-product |
+
+Measured after tightening: random figures are rejected about 91% of the time at
+three digits and essentially always at four or more, while every real derivation
+above passes. A test pins the false-accept rate so the check cannot quietly
+become decoration again.
+
+The checks are pure functions over a transcript and import no SDK, so the whole
+vocabulary is unit-tested offline and runs in `make ci` with no API key. That
+covers the two things most likely to be quietly wrong — a check that does not
+check what it says, and a case that asserts nothing. Loading the case file *is*
+the validation: an unknown check name raises rather than silently grading
+nothing, because an eval that quietly checks less than it claims is worse than no
+eval. Only the run itself costs money, and it is not in `make ci`.
 
 ## Data & provenance
 
@@ -516,14 +769,16 @@ label up from the code, so no analytic judgment is involved.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,store,server]"   # dev tooling + storage layer + MCP server
+pip install -e ".[dev,store,server,eval]"   # tooling + storage + server + evals
 cp .env.example .env             # then paste your Socrata app token
 ```
 
 The `store` extra pulls the Postgres drivers (`psycopg` + `psycopg-pool`); the
-`server` extra pulls `fastmcp` and `pydantic`. `duckdb` is a **core** dependency
-rather than an extra: ingest needs it for the point-in-polygon test that derives
-the `neighborhood` column, so a backfill cannot run without it.
+`server` extra pulls `fastmcp` and `pydantic`; `eval` pulls the Anthropic SDK,
+needed only to *run* the eval harness (its checks are tested without it).
+`duckdb` is a **core** dependency rather than an extra: ingest needs it for the
+point-in-polygon test that derives the `neighborhood` column, so a backfill
+cannot run without it.
 
 ### Running the MCP server
 
@@ -677,6 +932,7 @@ different plans.
 pytest                    # unit tests only (default; offline, no services needed)
 pytest -m integration     # need the storage stack up
 pytest -m spatial         # need DuckDB's spatial extension
+python -m evals           # the live eval harness: needs an API key and the stores
 ```
 
 The default run is hermetic: no network, no database. The two excluded markers
@@ -688,6 +944,12 @@ is missing.
 Integration tests run against a **dedicated `<db>_test` database** that is created
 on demand, so they never touch the data you've loaded into the dev database
 (override the target with `TEST_DATABASE_URL`).
+
+The evals are not a marker, they are a separate program: they make real API
+calls that cost real money, so they are never part of `pytest` or `make ci`.
+What *is* in `make ci` is the check vocabulary and the case file, tested
+offline — see "Does any of it work?" above. Run `python -m evals --preflight`
+first; it verifies everything except the model, for free.
 
 ### Explore the source data
 ```bash
@@ -707,8 +969,9 @@ src/chicago_crime_mcp/
   geo/         neighborhood polygons: point-in-polygon tagging (ingest) and
                name resolution (server)
   reference/   committed snapshots: IUCR codes, neighborhood boundaries + aliases
-  telemetry/   structured logging + failure telemetry
+  telemetry/   per-call JSON logging + the failure-telemetry rollup
 scripts/       data puller, reference refresh, Parquet migration, query-plan tool
+evals/         natural-language cases + the harness that grades tool-call behaviour
 tests/
 ```
 
@@ -721,5 +984,8 @@ tests/
   the result envelope, the teaching errors and `resolve_neighborhood`, which
   closes entity resolution. The Redis cache planned here was measured and cut —
   see "Why there is no cache"
-- [ ] **Phase 4** — observability, failure telemetry & tests
+- [x] **Phase 4** — observability, failure telemetry & evals — per-call
+  structured logging off the existing envelope, the six-report rollup with its
+  `resolve_neighborhood` alias backlog, and a live eval harness that grades
+  tool-call behaviour against the five affordances
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo

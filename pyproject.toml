@@ -28,6 +28,7 @@ chicago-crime-ingest = "chicago_crime_mcp.ingest.cli:main"
 chicago-crime-load = "chicago_crime_mcp.store.postgres.loader:main"
 chicago-crime-rollup = "chicago_crime_mcp.store.duckdb.rollups:main"
 chicago-crime-server = "chicago_crime_mcp.server.app:main"
+chicago-crime-telemetry = "chicago_crime_mcp.telemetry.rollup:main"
 
 [project.optional-dependencies]
 # Phase 2 - storage & query routing
@@ -43,9 +44,18 @@ server = [
     "fastmcp>=2.0",
     "pydantic>=2.9",
 ]
-# Dev tooling
+# Phase 4 - the eval harness. A client rather than a server, and the one
+# deliberate exception to the server-only scope: it is test tooling. Needs an
+# API key and makes real calls, so it never runs in `make ci`.
+eval = [
+    "anthropic>=0.40",
+]
+# Dev tooling. pyyaml is here rather than in `eval` because the eval *cases* are
+# validated by the offline unit tests -- a case naming a check that does not
+# exist would otherwise assert nothing and report a pass.
 dev = [
     "pytest>=8.3",
+    "pyyaml>=6.0",
     "ruff>=0.6",
 ]
 

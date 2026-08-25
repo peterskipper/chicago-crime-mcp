@@ -17,6 +17,11 @@ venv/
 *.parquet
 *.duckdb
 
+# Eval run output: full transcripts, regenerated every run, and they carry
+# whatever the model happened to say. Keep a run deliberately if it is worth
+# keeping, rather than by default.
+/runs/
+
 # OS / editor
 .DS_Store
 .idea/
