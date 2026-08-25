@@ -303,9 +303,18 @@ The domain is investigative, so what is kept is a decision rather than a default
   and the source data is block-level by design — deriving a specific address
   from it is prohibited and impossible. Rounding the coordinate would destroy
   the "which places do we answer badly" signal for no privacy gain.
-- **Retention is a file operation.** One file per day, so a retention policy is
-  `find … -mtime +N -delete` rather than a migration. Nothing here is written to
-  a database, which is one of the reasons it is not.
+- **Retention is a file operation** — one file per day, so enforcing a policy is
+  deleting files, with no lock to take and no space to reclaim afterwards:
+
+  ```bash
+  find data/telemetry -name 'calls-*.jsonl' -mtime +90 -delete   # keep 90 days
+  ```
+
+  Nothing here is written to a database, and this is one of the reasons: the
+  same policy over a table is a `DELETE` plus a `VACUUM`, contending with
+  whatever else holds the database open — and the rollup holds it open. Note
+  that **nothing in this repo runs that command**; the layout makes the policy
+  cheap to enforce, it does not enforce one for you.
 - **Off with one variable** — `TELEMETRY_ENABLED=0` stops the file sink; the
   one-line stderr summary is independent of it.
 
@@ -335,12 +344,29 @@ asserts that `resolve_neighborhood` is called *before* any filter, that the
 answer names the community area it widened to, and that "Andersonville" never
 appears.
 
+Running it needs three things: the `eval` extra installed, the stores the server
+itself needs (a loaded Postgres and a built rollup database), and Anthropic
+credentials — either `ANTHROPIC_API_KEY` in the environment or an `ant auth
+login` profile, which the SDK picks up on its own.
+
 ```bash
-python -m evals --preflight        # check server, stores and cases — no API call
-python -m evals --list
-python -m evals --affordance "entity resolution"
-python -m evals --json runs/latest.json
+export ANTHROPIC_API_KEY=sk-ant-...        # or: ant auth login
+
+python -m evals --preflight                # verify everything but the model, free
+python -m evals --list                     # the cases, without running them
+python -m evals --affordance "entity resolution"   # one group (6 cases)
+python -m evals                            # the full suite — real calls, real money
+python -m evals --json runs/latest.json    # keep the transcripts too
 ```
+
+Start with `--preflight`. It checks the cases load, the tool descriptions and
+schemas are published, the stores answer, and a teaching error still carries its
+suggestion — every one of which fails in a way that looks like a bad eval result
+rather than a broken setup. Then run one affordance group before paying for the
+sweep: it is enough to see whether the grading is behaving.
+
+Exit status is 0 when every case that was expected to pass did, so it can gate
+something later if that ever becomes useful.
 
 A few deliberate choices. It is a **manual tool-use loop**, not the SDK's tool
 runner — the runner is less code and hides the thing being measured, since the
