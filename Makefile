@@ -9,10 +9,10 @@
 PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
 
 install:
-	$(PY) -m pip install -e ".[dev, store, server]"
+	$(PY) -m pip install -e ".[dev, store, server, eval]"
 
 lint:
-	$(PY) -m ruff check src/ tests/
+	$(PY) -m ruff check src/ tests/ evals/ scripts/
 
 test:
 	$(PY) -m pytest tests/

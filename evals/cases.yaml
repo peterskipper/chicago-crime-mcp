@@ -1,0 +1,180 @@
+# Eval cases: one natural-language question, and what a correct run looks like.
+#
+# The assertions are about tool-call BEHAVIOUR, not prose. What the server can
+# influence is which tool a model reaches for, what it puts in the arguments,
+# whether an error taught it enough to retry, and whether it read the envelope
+# before answering. Phrasing is not graded, with two narrow exceptions:
+# answer_contains / answer_omits, used only where the answer is wrong without a
+# specific fact -- that a figure covers a wider area than was asked about, or
+# that a period is still filling.
+#
+# Cases are grouped by the affordance each is trying to break. The
+# "expected_failure" flag marks cases kept because they are hard, not because
+# they are known to pass; they are reported separately and do not fail the run.
+
+- id: aggregate-not-list
+  affordance: tool choice
+  question: How many burglaries were reported in Chicago in 2023?
+  expect:
+    calls_tool: [aggregate_incidents]
+    avoids_tool: [search_incidents]
+    grounded_numbers: true
+
+- id: schema-before-guessing
+  affordance: schema discovery
+  question: Which category of offense is most common in the Loop, and how many were there last year?
+  expect:
+    calls_tool: [describe_schema, aggregate_incidents]
+    calls_before: [describe_schema, aggregate_incidents]
+    grounded_numbers: true
+
+- id: list-is-a-search
+  affordance: tool choice
+  question: Show me a few recent robbery reports in district 18.
+  expect:
+    calls_tool: [search_incidents]
+    avoids_tool: [aggregate_incidents]
+    tool_args:
+      search_incidents:
+        district: "018"
+
+- id: point-lookup
+  affordance: tool choice
+  question: Tell me everything about the incident with id 13209384.
+  expect:
+    calls_tool: [get_incident]
+    avoids_tool: [search_incidents, aggregate_incidents]
+
+- id: radius-is-nearby
+  affordance: tool choice
+  question: What has been happening within 500 metres of latitude 41.8781, longitude -87.6298?
+  expect:
+    calls_tool: [nearby_incidents]
+    avoids_tool: [search_incidents]
+    grounded_numbers: true
+
+# --- entity resolution -------------------------------------------------------
+# The headline case. Bronzeville is a real, well-known Chicago neighborhood with
+# no boundary of its own, and difflib answers it with "Andersonville" -- 19.4 km
+# away, at the opposite end of the city, with a plausible number attached.
+
+- id: bronzeville-resolves-and-reports-the-widening
+  affordance: entity resolution
+  question: How much crime was there in Bronzeville last year?
+  expect:
+    calls_tool: [resolve_neighborhood]
+    calls_before: [resolve_neighborhood, aggregate_incidents]
+    # It has no boundary of its own, so the honest answer names the community
+    # area it widened to -- a broader question than the one asked.
+    answer_contains: [community area]
+    answer_omits: [Andersonville]
+    grounded_numbers: true
+
+- id: pilsen-resolves-to-a-community-area
+  affordance: entity resolution
+  question: Is Pilsen safer than it was three years ago?
+  expect:
+    calls_tool: [resolve_neighborhood]
+    calls_before: [resolve_neighborhood, aggregate_incidents]
+
+- id: named-boundary-answers-exactly
+  affordance: entity resolution
+  question: How many thefts were there in Wicker Park last year?
+  expect:
+    calls_tool: [resolve_neighborhood]
+    tool_args:
+      resolve_neighborhood:
+        name: Wicker Park
+    grounded_numbers: true
+
+- id: colloquial-spelling-resolves
+  affordance: entity resolution
+  question: What is the most common offense in Lakeview?
+  expect:
+    calls_tool: [resolve_neighborhood]
+    answer_omits: [could not find, no data for]
+
+- id: invented-place-is-not-answered
+  affordance: entity resolution
+  question: How many assaults were there in Bridgeporte Heights last year?
+  expect:
+    calls_tool: [resolve_neighborhood]
+    avoids_tool: [aggregate_incidents]
+    answer_contains: ["not"]
+
+# --- teaching errors ---------------------------------------------------------
+# These questions use a word the data does not: the category is MOTOR VEHICLE
+# THEFT, not "carjacking"; there is no "muggings" category. An error is the
+# designed path -- the claim under test is that the message was enough to act on.
+
+- id: recovers-from-an-invented-category
+  affordance: teaching errors
+  question: How many carjackings were there in 2024? Answer with the number, whatever the data calls it.
+  expect:
+    calls_tool: [aggregate_incidents]
+    grounded_numbers: true
+
+- id: recovers-from-a-bad-district
+  affordance: teaching errors
+  question: How many offenses were reported in police district 1 in 2024?
+  expect:
+    calls_tool: [aggregate_incidents]
+    grounded_numbers: true
+
+# --- the envelope: warnings a model has to read ------------------------------
+
+- id: does-not-report-a-fake-decline
+  affordance: result envelopes
+  question: Have thefts gone up or down over the last six months? Give me the monthly numbers.
+  expect:
+    calls_tool: [aggregate_incidents]
+    answer_contains: [incomplete]
+    grounded_numbers: true
+
+- id: reports-the-long-run-boundary-caveat
+  affordance: result envelopes
+  question: Compare offenses in ward 3 between 2016 and 2024.
+  expect:
+    calls_tool: [aggregate_incidents]
+    answer_contains: [boundar]
+    grounded_numbers: true
+
+- id: radius-excludes-ungeocoded
+  affordance: result envelopes
+  question: How many offenses were there within 300 metres of latitude 41.8919, longitude -87.6051, and is that the full count?
+  expect:
+    calls_tool: [nearby_incidents]
+    answer_contains: [coordinates]
+
+# --- bounded results ---------------------------------------------------------
+
+- id: broad-question-degrades-gracefully
+  affordance: bounded results
+  question: List every theft in Chicago in 2023.
+  expect:
+    no_error: true
+    grounded_numbers: true
+
+- id: does-not-invent-a-total-from-a-page
+  affordance: bounded results
+  question: List thefts in district 8 last month, then tell me how many there were in total.
+  expect:
+    calls_tool: [search_incidents]
+    grounded_numbers: true
+
+# --- provenance --------------------------------------------------------------
+
+- id: today-is-not-in-the-data
+  affordance: result envelopes
+  question: How many robberies were there in Chicago yesterday?
+  expect:
+    answer_contains: ["7 day"]
+    grounded_numbers: true
+
+- id: counts-offenses-not-crimes
+  affordance: result envelopes
+  question: How many crimes happened in Austin in 2023? Be precise about what you are counting.
+  expect:
+    calls_tool: [aggregate_incidents]
+    answer_contains: [offense]
+    grounded_numbers: true
