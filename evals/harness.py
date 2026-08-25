@@ -37,9 +37,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: Where the cases live.
 CASES_PATH = Path(__file__).parent / "cases.yaml"
 
-#: The model under evaluation. This measures the *tool surface*, so the model is
-#: a fixed instrument rather than the subject -- change it deliberately, and
-#: re-baseline when you do.
+#: The model under evaluation, overridable with ``EVAL_MODEL``.
+#:
+#: This measures the *tool surface*, so the model is an instrument rather than
+#: the subject. Two consequences worth stating, because a switchable instrument
+#: invites both mistakes:
+#:
+#: * **A scorecard is only comparable to another on the same model.** Which one
+#:   ran is recorded in the header and in the JSON for exactly that reason.
+#: * **Thinking is left unconfigured**, which is not the same thing on every
+#:   model. Opus 5 and Sonnet 5 run adaptive thinking when the parameter is
+#:   omitted; Haiku 4.5 predates that and runs with no thinking at all unless
+#:   given an explicit ``budget_tokens``. A Haiku run is therefore measuring
+#:   something meaningfully different, not just something cheaper.
 DEFAULT_MODEL = "claude-opus-5"
 
 #: Cap on model turns per question. Reached only by a model that is looping;
@@ -160,6 +170,18 @@ def to_anthropic_tools(mcp_tools: Sequence[Any]) -> list[dict[str, Any]]:
     ]
 
 
+def resolve_model() -> str:
+    """Return the model this run will use.
+
+    One function so the scorecard header and the request cannot disagree about
+    which model produced the results being reported.
+
+    Returns:
+        ``EVAL_MODEL`` if set, else :data:`DEFAULT_MODEL`.
+    """
+    return os.environ.get("EVAL_MODEL", DEFAULT_MODEL)
+
+
 async def run_case(client: Any, mcp: Any, tools: list[dict[str, Any]], case: Case) -> Transcript:
     """Run one question to completion and return the transcript.
 
@@ -178,7 +200,7 @@ async def run_case(client: Any, mcp: Any, tools: list[dict[str, Any]], case: Cas
 
     while transcript.turns < MAX_TURNS:
         response = await client.messages.create(
-            model=os.environ.get("EVAL_MODEL", DEFAULT_MODEL),
+            model=resolve_model(),
             max_tokens=MAX_TOKENS,
             system=SYSTEM,
             tools=tools,
@@ -344,6 +366,7 @@ __all__ = [
     "CaseResult",
     "load_cases",
     "preflight",
+    "resolve_model",
     "run_case",
     "run_suite",
     "to_anthropic_tools",

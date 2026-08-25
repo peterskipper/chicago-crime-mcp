@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from evals.harness import CaseResult, load_cases, preflight, run_suite
+from evals.harness import CaseResult, load_cases, preflight, resolve_model, run_suite
 
 
 def scorecard(results: list[CaseResult]) -> str:
@@ -30,7 +30,9 @@ def scorecard(results: list[CaseResult]) -> str:
     """
     width = max((len(r.case.id) for r in results), default=4) + 2
     header = f"{'Case':<{width}} Checks  Turns  Result"
-    lines = ["", header, "-" * len(header)]
+    # The model is part of the result, not a footnote: a scorecard only means
+    # something next to another one from the same instrument.
+    lines = ["", f"model: {resolve_model()}", "", header, "-" * len(header)]
     for result in results:
         held = sum(1 for c in result.checks if c.passed)
         if result.passed:
@@ -80,6 +82,7 @@ def as_json(results: list[CaseResult]) -> str:
     return json.dumps(
         [
             {
+                "model": resolve_model(),
                 "id": r.case.id,
                 "affordance": r.case.affordance,
                 "question": r.case.question,

@@ -368,6 +368,33 @@ sweep: it is enough to see whether the grading is behaving.
 Exit status is 0 when every case that was expected to pass did, so it can gate
 something later if that ever becomes useful.
 
+#### Which model to run it on
+
+`EVAL_MODEL` switches the instrument. The full 22-case suite costs roughly **$4
+on Opus 5**, and about $2 on Sonnet 5 or $0.60 on Haiku 4.5 — the input is
+dominated by ~3.1K tokens of tool definitions resent every turn plus a 3K-token
+`describe_schema` result, so a typical four-turn case sends ~23K input tokens.
+
+Those savings are small enough that cost should not drive the choice. What
+should:
+
+- **Opus 5 (default)** — the baseline. A failure is most likely attributable to
+  the tool surface rather than to the model, which is the whole point of the
+  exercise.
+- **Sonnet 5** — fine for routine re-runs while iterating on a tool description.
+- **Haiku 4.5** — worth running, but as a *different experiment*, not a discount.
+  A weaker model is a more sensitive detector of an under-specified surface: if
+  Opus can infer its way past a vague argument description, the eval passes and
+  the vagueness ships. The affordances exist precisely so a model does not have
+  to be clever — schema discovery so it need not guess, teaching errors so it can
+  self-correct — so a suite that passes on Haiku is a much stronger claim than
+  one that passes on Opus. Note that Haiku 4.5 predates adaptive thinking and
+  runs with **no thinking at all** under this harness, which omits the parameter;
+  that is a real difference in what is being measured, not just a cheaper run.
+
+Scorecards are only comparable within one model, so the model is printed in the
+header and recorded in the `--json` output.
+
 A few deliberate choices. It is a **manual tool-use loop**, not the SDK's tool
 runner — the runner is less code and hides the thing being measured, since the
 transcript *is* the grade. A teaching error is handed back to the model as a
