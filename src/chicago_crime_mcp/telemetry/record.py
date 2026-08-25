@@ -104,11 +104,23 @@ class CallRecord:
             summaries, not row dumps" a checkable claim rather than an
             intention.
         resolution_kind: See :data:`ResolutionKind`.
-        error_code: The teaching error's kind, from the closed vocabulary.
+        error_code: What kind of failure it was. Three families, and keeping
+            them apart is the point: one of
+            :data:`~chicago_crime_mcp.server.errors.ErrorCode` for a teaching
+            error (the self-correcting loop working as designed);
+            ``schema_validation`` when the arguments did not match the published
+            JSON Schema and the tool was never entered; ``unhandled`` for an
+            exception nobody planned for, which is a bug. A rate that mixes them
+            is uninterpretable -- the first is healthy, the second points at the
+            schema or its description, the third at us.
         error_field: The argument at fault, named as the tool declares it.
         error_received: The offending value, stringified. Grouping on this is
             how "which enum values does the model invent" gets answered.
         error_nearest_match: What the error proposed instead, if anything.
+        error_message: The failure in words, truncated. For a teaching error
+            this is redundant with the fields above; for ``schema_validation``
+            and ``unhandled`` it is the only diagnostic there is, which is why
+            it exists.
     """
 
     tool: str
@@ -136,6 +148,7 @@ class CallRecord:
     error_field: str | None = None
     error_received: str | None = None
     error_nearest_match: str | None = None
+    error_message: str | None = None
 
     def __post_init__(self) -> None:
         """Fill the identity fields that default to being generated here.

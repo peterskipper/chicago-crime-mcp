@@ -240,6 +240,68 @@ async def _invoke(mcp: Any, name: str, arguments: dict[str, Any]) -> tuple[ToolC
     return ToolCall(name=name, arguments=arguments, ok=True, result=body), payload
 
 
+async def preflight() -> list[str]:
+    """Check everything the suite needs except the model, and report.
+
+    Worth its own mode because every prerequisite here fails in a way that looks
+    like a bad eval result rather than a broken setup: an unloaded database
+    yields empty answers, a missing tool description yields poor tool choice.
+    Costs nothing and makes no API call.
+
+    Returns:
+        One line per finding, problems prefixed ``FAIL``.
+    """
+    from fastmcp import Client
+
+    from chicago_crime_mcp.server.app import create_app
+
+    findings: list[str] = []
+    cases = load_cases()
+    findings.append(f"ok    {len(cases)} case(s) load and validate")
+
+    async with Client(create_app()) as mcp:
+        tools = to_anthropic_tools(await mcp.list_tools())
+        findings.append(f"ok    {len(tools)} tool(s): {', '.join(t['name'] for t in tools)}")
+        for tool in tools:
+            # Only the description is required of every tool. An empty
+            # properties map is correct for a tool that takes no arguments --
+            # describe_schema is exactly that -- so a missing schema is only
+            # wrong when the schema itself is malformed.
+            if not tool["description"]:
+                findings.append(f"FAIL  {tool['name']} has no description for the model to read")
+            if tool["input_schema"].get("type") != "object":
+                findings.append(f"FAIL  {tool['name']} publishes a malformed argument schema")
+
+        # The stores answer, and the teaching-error path still teaches. Both are
+        # prerequisites several cases silently depend on, and both fail in ways
+        # that look like a poor eval result rather than a broken setup.
+        call, _ = await _invoke(mcp, "describe_schema", {})
+        if not call.ok:
+            findings.append(f"FAIL  describe_schema raised: {call.error}")
+        else:
+            coverage = (call.result or {}).get("provenance", {})
+            findings.append(
+                f"ok    stores answered; data covers "
+                f"{coverage.get('coverage_start', '?')} to {coverage.get('coverage_end', '?')} "
+                f"({coverage.get('rows', '?')} rows)"
+            )
+        probe = {"types": ["BATERY"], "start": "2024-01-01", "end": "2024-02-01"}
+        bad, message = await _invoke(mcp, "search_incidents", probe)
+        if bad.ok:
+            findings.append("FAIL  an invented category was accepted instead of taught")
+        elif "BATTERY" in (message or ""):
+            findings.append("ok    teaching errors reach the caller with a suggestion")
+        else:
+            findings.append(f"FAIL  error carried no suggestion: {message[:80]}")
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        findings.append(
+            "note  ANTHROPIC_API_KEY is unset; the SDK will fall back to an "
+            "`ant auth login` profile if one exists"
+        )
+    return findings
+
+
 async def run_suite(cases: Sequence[Case]) -> list[CaseResult]:
     """Run every case against a freshly built server.
 
@@ -281,6 +343,7 @@ __all__ = [
     "Case",
     "CaseResult",
     "load_cases",
+    "preflight",
     "run_case",
     "run_suite",
     "to_anthropic_tools",

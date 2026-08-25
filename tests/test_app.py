@@ -288,6 +288,38 @@ def test_a_successful_call_is_recorded_from_the_serialized_envelope():
     assert record.duration_ms > 0
 
 
+def test_a_real_schema_rejection_is_classified_as_schema_validation():
+    """Driven for real, because the claim is about what FastMCP raises.
+
+    A call missing a required argument never enters the tool, so no teaching
+    error can be raised and FastMCP rejects it itself. The stubbed tests assert
+    we classify a FastMCPToolError correctly; only this one shows that argument
+    rejection actually arrives as one.
+    """
+    sink = RecordingSink()
+    app = FastMCP(name="probe")
+    app.add_middleware(CallTelemetryMiddleware(sink=sink))
+
+    @app.tool
+    def needs_a_span(start: str, end: str) -> Envelope:
+        """A tool with required arguments."""
+        return _envelope(row_count=0, route=RouteInfo(store="duckdb", reason="x", elapsed_ms=1.0))
+
+    async def call():
+        async with Client(app) as client:
+            await client.call_tool("needs_a_span", {})
+
+    with pytest.raises(FastMCPToolError):
+        asyncio.run(call())
+
+    record = sink.only
+    assert record.outcome == "error"
+    assert record.error_code == "schema_validation", (
+        "argument rejection was misfiled; the rollup would report it as a bug"
+    )
+    assert record.error_message
+
+
 def test_an_empty_result_is_recorded_as_empty_not_ok():
     """'Valid filters, nothing matched' is the signal; it must not read as success."""
     sink = RecordingSink()

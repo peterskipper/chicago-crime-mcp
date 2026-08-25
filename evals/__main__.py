@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-from evals.harness import CaseResult, load_cases, run_suite
+from evals.harness import CaseResult, load_cases, preflight, run_suite
 
 
 def scorecard(results: list[CaseResult]) -> str:
@@ -115,7 +115,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--affordance", help="Run only cases for this affordance.")
     parser.add_argument("--json", type=Path, help="Also write the full results here.")
     parser.add_argument("--list", action="store_true", help="List the cases and exit.")
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Check the server, stores and cases without calling the model.",
+    )
     args = parser.parse_args(argv)
+
+    if args.preflight:
+        findings = asyncio.run(preflight())
+        for line in findings:
+            print(line)
+        return 1 if any(line.startswith("FAIL") for line in findings) else 0
 
     cases = load_cases()
     if args.only:

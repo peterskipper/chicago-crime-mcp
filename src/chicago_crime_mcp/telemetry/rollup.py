@@ -67,12 +67,23 @@ COLUMNS: dict[str, str] = {
     "error_field": "VARCHAR",
     "error_received": "VARCHAR",
     "error_nearest_match": "VARCHAR",
+    "error_message": "VARCHAR",
 }
 
 #: Arguments that are mechanism rather than filter. Excluded from the "filter
 #: combination" grouping: a page size does not explain why nothing matched, and
-#: leaving it in would split one real combination across several rows.
-MECHANISM_ARGS = ("limit", "cursor", "offset", "taxonomy")
+#: leaving it in would split one real combination across several rows. Taken
+#: from the tools' actual signatures -- ``taxonomy`` narrows nothing (it changes
+#: what the category column means), and ``include_rows`` / ``nearest`` shape the
+#: response rather than the query.
+MECHANISM_ARGS = (
+    "limit",
+    "cursor",
+    "offset",
+    "taxonomy",
+    "include_rows",
+    "nearest",
+)
 
 #: Columns of ``reference/neighborhood_aliases.csv``, so the backlog is emitted
 #: as a file that can be diffed against the real one rather than a report
@@ -306,10 +317,13 @@ def arg_failures(conn: duckdb.DuckDBPyConnection) -> Report:
     return Report(
         title="Malformed arguments by field",
         note=(
-            "Each row is a teaching error the model had to recover from. The "
-            "invented values are the useful part: a value several callers reach "
-            "for is a synonym the tool description should have accepted or named. "
-            "error_code='unhandled' is not a teaching error -- it is a bug."
+            "Three families, kept apart on purpose. A teaching error is the "
+            "self-correcting loop working, and the invented values are the useful "
+            "part -- a value several callers reach for is a synonym the tool "
+            "description should have accepted or named. 'schema_validation' means "
+            "the arguments never matched the published JSON Schema, so the tool was "
+            "not entered: that points at the schema or its description rather than "
+            "at the vocabulary. 'unhandled' is a bug."
         ),
         rows=_rows(
             conn,

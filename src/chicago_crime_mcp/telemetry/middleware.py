@@ -17,11 +17,27 @@ receives an ``UnknownValueError`` with its structured fields intact. The
 distinction matters enough that ``tests/test_app.py`` drives a real server and
 not a stubbed chain.
 
-**An unhandled exception is logged too**, under ``error_code="unhandled"`` --
+**Three families of failure, kept apart.** A teaching error is the
+self-correcting loop working as designed. ``schema_validation`` is FastMCP
+rejecting arguments that did not match the published JSON Schema -- the tool was
+never entered, so no teaching error could have been raised, and the finding
+points at the schema or its description rather than at the offense vocabulary.
+``unhandled`` is an exception nobody planned for: a bug. Both of the latter sit
 outside the closed :data:`~chicago_crime_mcp.server.errors.ErrorCode` vocabulary
-on purpose, because it is not a teaching error and should never be counted as
-one. A teaching error is the self-correcting loop working; ``unhandled`` is a
-bug, and the query that separates them is the point.
+deliberately, because an error rate that mixes the three is uninterpretable.
+
+**Argument rejection arrives as ``ValidationError``, not ``ToolError``, and that
+was measured.** The client sees a ``ToolError`` -- FastMCP converts it *above*
+the middleware chain -- so catching ``ToolError`` here looks right and files
+every rejected call as a bug. What actually reaches this layer is
+``fastmcp.exceptions.ValidationError``, which descends from ``FastMCPError`` and
+not from ``ToolError`` at all. A framework-raised ``ToolError`` is caught
+alongside it: both mean the call was refused deliberately, outside our tool
+code, which is the distinction that matters.
+
+The ``except`` order below is also load-bearing: our ``ToolError`` subclasses
+FastMCP's, so ours has to be caught first or every teaching error would be
+misfiled as a schema rejection.
 
 Docstrings follow the Google Python style.
 """
@@ -32,6 +48,8 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
+from fastmcp.exceptions import ToolError as FastMCPToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from chicago_crime_mcp.server.errors import ToolError
@@ -40,6 +58,11 @@ from chicago_crime_mcp.telemetry.sink import TelemetrySink
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping
+
+#: Cap on the stored error message. A schema-validation failure over a wide
+#: signature can run to several hundred characters, and the diagnostic value is
+#: all in the first line or two.
+MAX_ERROR_MESSAGE = 600
 
 #: The tool whose answer shape gets its own column. See
 #: :data:`~chicago_crime_mcp.telemetry.record.ResolutionKind`.
@@ -87,8 +110,18 @@ class CallTelemetryMiddleware(Middleware):
         try:
             result = await call_next(context)
         except ToolError as exc:
+            # Ours. Must precede the FastMCP clause -- it is a subclass of it.
             record = self._error_record(
                 tool, args, identity, started, code=str(exc.code), details=exc.details()
+            )
+            raise
+        except (FastMCPValidationError, FastMCPToolError) as exc:
+            # The framework refusing the call. In practice always the former:
+            # argument-schema rejection, where the tool was never entered and so
+            # had no chance to raise a teaching error.
+            record = self._error_record(
+                tool, args, identity, started, code="schema_validation",
+                details={"message": str(exc)},
             )
             raise
         except Exception as exc:
@@ -166,6 +199,7 @@ class CallTelemetryMiddleware(Middleware):
             The record.
         """
         received = details.get("received")
+        message = details.get("message")
         return CallRecord(
             tool=tool,
             outcome="error",
@@ -175,6 +209,7 @@ class CallTelemetryMiddleware(Middleware):
             error_field=details.get("field"),
             error_received=None if received is None else str(received),
             error_nearest_match=details.get("nearest_match"),
+            error_message=None if message is None else str(message)[:MAX_ERROR_MESSAGE],
             resolution_kind="none" if tool == RESOLVE_TOOL else None,
             **identity,
         )
@@ -268,4 +303,4 @@ class CallTelemetryMiddleware(Middleware):
         return None
 
 
-__all__ = ["RESOLVE_TOOL", "CallTelemetryMiddleware"]
+__all__ = ["MAX_ERROR_MESSAGE", "RESOLVE_TOOL", "CallTelemetryMiddleware"]

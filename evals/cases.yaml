@@ -36,7 +36,12 @@
     avoids_tool: [aggregate_incidents]
     tool_args:
       search_incidents:
-        district: "018"
+        geography: district
+        # Zero-padded: the data stores districts as three characters, and the
+        # tool descriptions say so. A model that sends "18" gets a teaching
+        # error and should retry -- tool_args matches on any call, so the retry
+        # counts.
+        geography_values: ["018"]
 
 - id: point-lookup
   affordance: tool choice

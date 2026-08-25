@@ -16,8 +16,11 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from fastmcp.exceptions import ToolError as FastMCPToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 
 from chicago_crime_mcp.server.errors import InvalidArgumentError, UnknownValueError
+from chicago_crime_mcp.telemetry import middleware as middleware_module
 from chicago_crime_mcp.telemetry.middleware import CallTelemetryMiddleware
 from tests.helpers import RecordingSink
 
@@ -221,6 +224,61 @@ def test_a_non_string_received_value_is_stringified():
     """Grouping on 'which values does the model invent' needs one type."""
     record, _ = _drive(raises=InvalidArgumentError("too big", field="limit", received=10_000))
     assert record.error_received == "10000"
+
+
+def test_a_teaching_error_is_not_misfiled_as_a_schema_rejection():
+    """Our ToolError subclasses FastMCP's, so the except order is load-bearing.
+
+    Swap the two clauses and every teaching error in the logs becomes
+    'schema_validation' -- the error rate would look identical and every
+    conclusion drawn from it would be wrong.
+    """
+    record, _ = _drive(raises=UnknownValueError("x", field="types", received="BATERY"))
+    assert record.error_code == "unknown_value"
+
+
+def test_a_fastmcp_schema_rejection_is_its_own_category():
+    """The tool was never entered, so no teaching error could have been raised.
+
+    ``ValidationError`` is what actually reaches middleware; the client sees a
+    ``ToolError`` because FastMCP converts it above the chain. Pinned here
+    because catching the wrong one files every rejected call as a bug.
+    """
+    record, _ = _drive(raises=FastMCPValidationError("Missing required argument: start"))
+    assert record.outcome == "error"
+    assert record.error_code == "schema_validation"
+    assert "Missing required argument" in record.error_message
+
+
+def test_the_three_error_families_are_distinguishable():
+    """An error rate that mixes them is uninterpretable."""
+    teaching, _ = _drive(raises=UnknownValueError("x", field="types"))
+    schema, _ = _drive(raises=FastMCPValidationError("bad args"))
+    bug, _ = _drive(raises=RuntimeError("boom"))
+    assert len({teaching.error_code, schema.error_code, bug.error_code}) == 3
+
+
+def test_a_framework_raised_tool_error_is_also_not_counted_as_a_bug():
+    """Refused deliberately outside our tool code is the distinction that matters."""
+    record, _ = _drive(raises=FastMCPToolError("refused"))
+    assert record.error_code == "schema_validation"
+
+
+def test_an_unhandled_exception_keeps_its_message():
+    """For a bug the message is the only diagnostic there is."""
+    record, _ = _drive(raises=RuntimeError("connection reset"))
+    assert record.error_message == "RuntimeError: connection reset"
+
+
+def test_a_very_long_error_message_is_truncated():
+    """A wide signature's validation dump should not bloat every log line."""
+    record, _ = _drive(raises=FastMCPValidationError("x" * 5000))
+    assert len(record.error_message) == middleware_module.MAX_ERROR_MESSAGE
+
+
+def test_a_teaching_error_also_records_its_message():
+    record, _ = _drive(raises=UnknownValueError("no such category.", field="types"))
+    assert record.error_message == "no such category."
 
 
 def test_an_unhandled_exception_is_recorded_but_not_as_a_teaching_error():
