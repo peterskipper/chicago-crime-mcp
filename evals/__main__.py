@@ -28,7 +28,9 @@ def scorecard(results: list[CaseResult]) -> str:
     Returns:
         The scorecard.
     """
-    lines = ["", "Case                                     Checks   Turns  Result", "-" * 72]
+    width = max((len(r.case.id) for r in results), default=4) + 2
+    header = f"{'Case':<{width}} Checks  Turns  Result"
+    lines = ["", header, "-" * len(header)]
     for result in results:
         held = sum(1 for c in result.checks if c.passed)
         if result.passed:
@@ -36,18 +38,18 @@ def scorecard(results: list[CaseResult]) -> str:
         else:
             mark = "known-hard" if result.case.expected_failure else "FAIL"
         lines.append(
-            f"{result.case.id:<40} {held:>2}/{len(result.checks):<2}   "
-            f"{result.transcript.turns:>3}    {mark}"
+            f"{result.case.id:<{width}} {held:>2}/{len(result.checks):<2}  "
+            f"{result.transcript.turns:>4}   {mark}"
         )
         for check in result.checks:
             if not check.passed:
-                lines.append(f"{'':<40}   - {check.name}: {check.detail}")
+                lines.append(f"{'':<{width}}   - {check.name}: {check.detail}")
 
     by_affordance: dict[str, list[bool]] = defaultdict(list)
     for result in results:
         by_affordance[result.case.affordance].append(result.passed)
 
-    lines += ["", "By affordance", "-" * 72]
+    lines += ["", "By affordance", "-" * len(header)]
     for affordance, outcomes in sorted(by_affordance.items()):
         lines.append(f"  {affordance:<24} {sum(outcomes)}/{len(outcomes)}")
 

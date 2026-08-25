@@ -126,6 +126,68 @@
     calls_tool: [aggregate_incidents]
     grounded_numbers: true
 
+# --- taxonomy: the one choice that can flip the sign of an answer ------------
+# `stable_category` exists because IUCR code 0760 (BURGLARY FROM MOTOR VEHICLE)
+# was re-grouped out of BURGLARY. Measured over the loaded window, citywide
+# burglary 2024 -> 2025 reads 8,434 -> 9,741 under taxonomy='source' and
+# 7,659 -> 6,213 under 'comparable'. Up 15% or down 19%: the same question, and
+# the taxonomy decides the direction.
+#
+# Nothing warns about it. The coverage-drift warning is bounds-based -- it fires
+# for codes introduced or retired inside the span -- and 0760 is present
+# throughout, so it stays silent (verified: `warnings: []` in both modes for this
+# query). The model therefore has to get here from describe_schema and the
+# `taxonomy` argument description alone, which is exactly what these two grade.
+
+- id: comparable-taxonomy-for-a-multi-year-trend
+  affordance: schema discovery
+  question: Compare burglary in Chicago in 2024 and 2025 on a like-for-like basis, so that changes in how offenses are classified do not distort the comparison.
+  expect:
+    calls_tool: [aggregate_incidents]
+    # The argument's own description says 'comparable' "is the right choice for
+    # a multi-year trend". This case is the test of whether that sentence lands.
+    tool_args:
+      aggregate_incidents:
+        taxonomy: comparable
+    grounded_numbers: true
+
+- id: taxonomy-basis-is-disclosed-on-a-trend
+  affordance: result envelopes
+  # Deliberately does NOT mention classification. A bare direction is not an
+  # answer here, because the direction depends on a choice the caller never made.
+  question: Did burglary in Chicago go up or down between 2024 and 2025?
+  # Marked hard rather than known-broken, and it has not been run: no warning
+  # fires for this query, so disclosing the basis has to be volunteered off the
+  # envelope's taxonomy_mode field. Flip this to a normal case the first time it
+  # passes. The substring is also the brittlest assertion in the suite -- a model
+  # that says "classification basis" instead is arguably right and scores wrong.
+  expected_failure: true
+  expect:
+    calls_tool: [aggregate_incidents]
+    answer_contains: [taxonom]
+    grounded_numbers: true
+
+# --- the renamed label -------------------------------------------------------
+# `primary_type_canonical` folds CPD's two spellings together (CRIM SEXUAL
+# ASSAULT, 6,581 rows, transitioning to CRIMINAL SEXUAL ASSAULT over 2015-2020).
+# That fold happens at ingest, so it is an invariant rather than a decision and
+# there is nothing for a model to get right -- see the note in the README. The
+# one part that IS observable is this: describe_schema names the retired spelling
+# in its own prose, so a model can read it there and try to filter on it.
+
+- id: the-retired-label-still-reaches-the-right-rows
+  affordance: teaching errors
+  question: How many CRIM SEXUAL ASSAULT offenses were reported in Chicago in 2023?
+  expect:
+    calls_tool: [aggregate_incidents]
+    # However it gets there -- its own knowledge, or the teaching error, which
+    # does suggest this exact string -- it has to end up on the canonical value.
+    # The failure this guards is a confident "there were none".
+    tool_args:
+      aggregate_incidents:
+        types: ["CRIMINAL SEXUAL ASSAULT"]
+    grounded_numbers: true
+
 # --- the envelope: warnings a model has to read ------------------------------
 
 - id: does-not-report-a-fake-decline

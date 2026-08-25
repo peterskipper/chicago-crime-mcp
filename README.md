@@ -377,6 +377,46 @@ untestable. And there is **no system prompt** beyond one sentence: the server's
 own `INSTRUCTIONS` and tool docstrings are what is under test, so extra guidance
 here would grade a prompt this project does not ship.
 
+#### What belongs in an eval, and what does not
+
+The two normalized offense columns make the line concrete, because they sit on
+opposite sides of it.
+
+**`stable_category` is a decision, so it is evaluated.** It backs the `taxonomy`
+argument, which defaults to `source` and is *never* auto-switched — inferring it
+from the question was rejected in Phase 2. The stakes are as high as they get
+here: measured over the loaded window, citywide burglary 2024 → 2025 reads
+**8,434 → 9,741 under `source` and 7,659 → 6,213 under `comparable`**. Up 15% or
+down 19%, from the same data, decided by an argument the user never sees. Worse,
+nothing warns about it — the coverage-drift warning is bounds-based and fires for
+codes introduced or retired mid-span, while IUCR `0760` is present throughout and
+merely re-grouped. So the model has to arrive at the right taxonomy from
+`describe_schema` and the argument description alone, and whether it does is a
+question only a model can answer. Two cases cover it: one where the question asks
+for a like-for-like comparison, and one where it does not and the answer is
+expected to disclose its basis anyway.
+
+**`primary_type_canonical` is an invariant, so it is not.** CPD spelled the same
+offense `CRIM SEXUAL ASSAULT` for 6,581 rows and `CRIMINAL SEXUAL ASSAULT` for
+11,972, transitioning across 2015–2020. That fold happens **at ingest**, before
+anything is stored, so by the time a model can see the data there is exactly one
+value and no choice to make. An eval grades behaviour; there is no behaviour here
+to grade, and a case asserting "the count is right" could not tell a correct
+answer from a plausible one — `grounded_numbers` only checks that a figure came
+from a tool, not that the tool was right. The instrument that *can* prove this is
+a unit test over the ingest transform, and that is where it lives
+(`tests/test_schema.py`).
+
+One slice of it is genuinely eval-shaped, and has a case: `describe_schema`
+names the retired spelling in its own prose, explaining what was unified. A model
+can read it there and try to filter on it. The teaching error does suggest the
+canonical value — so the case asserts that, however it gets there, the query ends
+up on `CRIMINAL SEXUAL ASSAULT` rather than returning a confident "there were
+none". That is a test of the error path, not of the column.
+
+The general rule: **if the column changes what the model must decide, evaluate
+it; if it changes what the model is handed, unit-test it.**
+
 The checks are pure functions over a transcript and import no SDK, so the whole
 vocabulary is unit-tested offline and runs in `make ci` with no API key. That
 covers the two things most likely to be quietly wrong — a check that does not
