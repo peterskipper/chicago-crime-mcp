@@ -18,6 +18,37 @@ from pathlib import Path
 
 from evals.harness import CaseResult, load_cases, preflight, resolve_model, run_suite
 
+#: Width of the progress bar, in characters.
+BAR_WIDTH = 24
+
+
+def progress(index: int, total: int, result: CaseResult) -> None:
+    """Print one line as each case finishes, to stderr.
+
+    A bar rather than a spinner because the work is countable, and a line per
+    case rather than one rewritten in place because the interesting part is
+    *which* case is slow or failing -- a suite run takes minutes and is usually
+    watched intermittently. stderr keeps the scorecard on stdout pipeable.
+
+    Args:
+        index: 1-based position of the case that just finished.
+        total: How many cases are running.
+        result: Its graded outcome.
+    """
+    filled = round(BAR_WIDTH * index / total)
+    bar = "#" * filled + "." * (BAR_WIDTH - filled)
+    if result.passed:
+        mark = "pass"
+    else:
+        mark = "known-hard" if result.case.expected_failure else "FAIL"
+    held = sum(1 for c in result.checks if c.passed)
+    print(
+        f"[{bar}] {index:>2}/{total}  {result.case.id:<46} "
+        f"{held}/{len(result.checks)}  {result.transcript.turns} turns  {mark}",
+        file=sys.stderr,
+        flush=True,
+    )
+
 
 def scorecard(results: list[CaseResult]) -> str:
     """Render the results as a table plus a per-affordance summary.
@@ -147,7 +178,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{case.id:<45} {case.affordance:<20} {case.question}")
         return 0
 
-    results = asyncio.run(run_suite(cases))
+    print(
+        f"running {len(cases)} case(s) on {resolve_model()}",
+        file=sys.stderr,
+        flush=True,
+    )
+    results = asyncio.run(run_suite(cases, on_progress=progress))
     print(scorecard(results))
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)

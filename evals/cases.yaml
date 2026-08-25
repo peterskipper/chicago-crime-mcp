@@ -34,13 +34,14 @@
   expect:
     calls_tool: [search_incidents]
     avoids_tool: [aggregate_incidents]
-    tool_args:
+    # Asserted against the filters the envelope echoes back, not against what
+    # the model typed. Measured: a real run sent `geography_values: [18]` as an
+    # integer, the server normalized it to "018" and answered correctly, and an
+    # assertion on the wire form failed a run that did everything right. The
+    # normalized value is the contract the envelope actually makes.
+    result_filters:
       search_incidents:
         geography: district
-        # Zero-padded: the data stores districts as three characters, and the
-        # tool descriptions say so. A model that sends "18" gets a teaching
-        # error and should retry -- tool_args matches on any call, so the retry
-        # counts.
         geography_values: ["018"]
 
 - id: point-lookup
@@ -156,12 +157,12 @@
   # Deliberately does NOT mention classification. A bare direction is not an
   # answer here, because the direction depends on a choice the caller never made.
   question: Did burglary in Chicago go up or down between 2024 and 2025?
-  # Marked hard rather than known-broken, and it has not been run: no warning
-  # fires for this query, so disclosing the basis has to be volunteered off the
-  # envelope's taxonomy_mode field. Flip this to a normal case the first time it
-  # passes. The substring is also the brittlest assertion in the suite -- a model
-  # that says "classification basis" instead is arguably right and scores wrong.
-  expected_failure: true
+  # Was marked expected_failure on the reasoning that disclosure has to be
+  # volunteered -- no warning fires for this query, so the basis can only come
+  # off the envelope's taxonomy_mode field. It passed on the first real run
+  # (2026-08-25), so it is a normal case now. The substring remains the
+  # brittlest assertion in the suite: a model that says "classification basis"
+  # instead is arguably right and would score wrong.
   expect:
     calls_tool: [aggregate_incidents]
     answer_contains: [taxonom]
@@ -235,7 +236,9 @@
   affordance: result envelopes
   question: How many robberies were there in Chicago yesterday?
   expect:
-    answer_contains: ["7 day"]
+    # A single substring made this a test of phrasing: a real run stated the
+    # caveat correctly and scored a miss for writing it another way.
+    answer_contains_any: ["7 day", "7-day", "seven day", "week", "most recent"]
     grounded_numbers: true
 
 - id: counts-offenses-not-crimes

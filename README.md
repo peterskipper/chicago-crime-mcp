@@ -395,6 +395,15 @@ should:
 Scorecards are only comparable within one model, so the model is printed in the
 header and recorded in the `--json` output.
 
+Progress prints to stderr as each case finishes, so the scorecard on stdout
+stays pipeable:
+
+```
+running 22 case(s) on claude-opus-5
+[####....................]  1/22  aggregate-not-list      3/3  3 turns  pass
+[########................]  2/22  schema-before-guessing  4/4  3 turns  pass
+```
+
 A few deliberate choices. It is a **manual tool-use loop**, not the SDK's tool
 runner — the runner is less code and hides the thing being measured, since the
 transcript *is* the grade. A teaching error is handed back to the model as a

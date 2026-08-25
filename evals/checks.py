@@ -19,13 +19,21 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Sequence
 
 #: Numbers below this many digits are ignored by :func:`grounded_numbers`.
 #: "the top 5 categories" and "3 of them" are the model counting its own list,
 #: not citing a figure, and demanding a source for those would fail every
 #: correct answer.
 MIN_GROUNDED_DIGITS = 3
+
+#: Series longer than this are skipped by the pairwise part of
+#: :func:`_derivable`. The scan is quadratic, and a long series makes almost any
+#: number reachable -- both reasons point the same way.
+MAX_SERIES = 60
 
 
 @dataclass(frozen=True)
@@ -95,13 +103,56 @@ class Transcript:
     def results_blob(self) -> str:
         """Return every successful result serialized into one string.
 
-        Used by :func:`grounded_numbers` to ask whether a figure in the answer
-        appeared anywhere the model could have read it.
-
         Returns:
             The concatenated JSON of every successful result.
         """
         return json.dumps([c.result for c in self.calls if c.ok], default=str)
+
+    def result_numbers(self) -> tuple[set[float], list[list[float]]]:
+        """Return the figures a model could have read, and how they group.
+
+        Two shapes, because grounding needs both. The flat set answers "was this
+        number handed to the model at all". The per-key series answer "could the
+        model have *computed* it" -- summing a column of monthly buckets into a
+        total is the single commonest thing a correct answer does, and it is
+        indistinguishable from invention unless the series is kept intact.
+
+        Only successful calls contribute: a figure cited out of an error message
+        is not a sourced figure.
+
+        Returns:
+            A ``(all_values, series)`` pair, where ``series`` holds one list per
+            repeated key across the result structures.
+        """
+        flat: set[float] = set()
+        series: dict[str, list[float]] = {}
+
+        def walk(node: Any, key: str) -> None:
+            if isinstance(node, bool):
+                return
+            if isinstance(node, (int, float)):
+                flat.add(float(node))
+                series.setdefault(key, []).append(float(node))
+            elif isinstance(node, str):
+                # Every digit run inside a string counts as handed to the model,
+                # not just wholly-numeric strings. Three kinds of figure arrive
+                # this way and all three are legitimately quotable: zero-padded
+                # districts and IUCR codes ("018", "0325"), the year inside a
+                # period ("2016-01-01"), and the numbers written into a warning
+                # message, which the model read along with everything else.
+                for run in _digits(node):
+                    flat.add(float(run))
+            elif isinstance(node, dict):
+                for k, v in node.items():
+                    walk(v, k)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item, key)
+
+        for call in self.calls:
+            if call.ok:
+                walk(call.result, "")
+        return flat, list(series.values())
 
 
 @dataclass(frozen=True)
@@ -191,6 +242,92 @@ def tool_args(transcript: Transcript, spec: dict[str, dict[str, Any]]) -> list[C
             )
         )
     return results
+
+
+def result_filters(transcript: Transcript, spec: dict[str, dict[str, Any]]) -> list[CheckResult]:
+    """Require that a tool *applied* given filter values, as the envelope echoes them.
+
+    Distinct from :func:`tool_args`, and the difference is the point. That one
+    reads what the model typed; this reads ``filters_applied``, which is the
+    value after normalization. A model that sends ``geography_values: [18]`` for
+    district 18 is not wrong -- the server zero-pads it to ``"018"`` and answers
+    correctly -- so asserting the wire form tests a spelling the surface does not
+    require. Assert the interpreted value and the check follows the contract the
+    envelope actually makes.
+
+    Args:
+        transcript: The run.
+        spec: ``{tool: {field: value}}``, compared as strings so ``18`` and
+            ``"018"`` are not held apart by type alone.
+
+    Returns:
+        One result per tool named.
+    """
+    results = []
+    for tool, wanted in spec.items():
+        seen = []
+        matched = False
+        for call in transcript.named(tool):
+            applied = (call.result or {}).get("filters_applied") or {}
+            seen.append(applied)
+            if all(_as_text(applied.get(k)) == _as_text(v) for k, v in wanted.items()):
+                matched = True
+        results.append(
+            CheckResult(
+                name=f"result_filters[{tool}]",
+                passed=matched,
+                detail=(
+                    f"matched on {len(transcript.named(tool))} call(s)"
+                    if matched
+                    else f"wanted {wanted}; applied {seen or 'no calls'}"
+                ),
+            )
+        )
+    return results
+
+
+def _as_text(value: Any) -> Any:
+    """Render a filter value for comparison, ignoring numeric-vs-string typing.
+
+    Zero-padding is preserved -- ``"018"`` and ``"18"`` stay different, because
+    the district really is three characters. What is collapsed is only the
+    difference between the number 18 and the string "18".
+
+    Args:
+        value: A filter value, possibly a list.
+
+    Returns:
+        The value as a string, or a list of strings.
+    """
+    if isinstance(value, list):
+        return [_as_text(v) for v in value]
+    return str(value)
+
+
+def answer_contains_any(transcript: Transcript, wanted: list[str]) -> list[CheckResult]:
+    """Require that the answer contains at least one of several phrasings.
+
+    For a fact with more than one natural wording. "the feed excludes the most
+    recent 7 days" is a real thing to check for and the model may write it as
+    "7-day", "seven days" or "a week"; a single substring makes the check about
+    phrasing rather than about whether the caveat landed.
+
+    Args:
+        transcript: The run.
+        wanted: Acceptable substrings, matched case-insensitively.
+
+    Returns:
+        One result.
+    """
+    answer = transcript.answer.lower()
+    hit = [needle for needle in wanted if needle.lower() in answer]
+    return [
+        CheckResult(
+            name=f"answer_contains_any[{'|'.join(wanted)}]",
+            passed=bool(hit),
+            detail=f"matched {hit}" if hit else "none of them appeared",
+        )
+    ]
 
 
 def recovers_from_error(transcript: Transcript, _spec: bool) -> list[CheckResult]:
@@ -284,31 +421,43 @@ def answer_omits(transcript: Transcript, forbidden: list[str]) -> list[CheckResu
 
 
 def grounded_numbers(transcript: Transcript, _spec: bool) -> list[CheckResult]:
-    """Require that every substantial figure in the answer came from a result.
+    """Require that every substantial figure in the answer is sourced or derivable.
 
-    A heuristic, and worth being honest about what it can and cannot do. It
-    ignores numbers of fewer than :data:`MIN_GROUNDED_DIGITS` digits (list
-    positions and small counts the model derived itself) and numbers already
-    present in the question. What is left is the class this is for: a plausible
-    four-digit total that appears in no tool result.
+    A heuristic, and the first version of it was a bad one: it demanded that
+    every number appear *verbatim* in a tool result, which failed a correct
+    answer for summing six monthly buckets into a total. Measured against a real
+    run, that produced eight of nine failures and buried every other signal in
+    the suite. Three things were being conflated, and only the first is a defect:
 
-    It cannot catch a figure that is real but misattributed, and it will not try
-    to. It catches invention, which is the failure that makes a grounded data
-    tool worthless.
+    * **invention** -- a figure with no relationship to the data;
+    * **derivation** -- a total, a difference, a percentage. Correct arithmetic,
+      and exactly what a useful answer does;
+    * **identifiers** -- IUCR codes, district numbers, years. Not figures at all.
+
+    So a number passes if it was handed to the model, or if it is the sum of one
+    of the result's own series, or a difference or percentage relating two values
+    within one series. What is left over is the thing worth failing on.
+
+    It still cannot catch a real figure that is misattributed, and does not try.
+    It catches invention, which is the failure that makes a grounded data tool
+    worthless.
 
     Args:
         transcript: The run.
         _spec: Unused; the check is enabled by being listed.
 
     Returns:
-        One result naming any ungrounded figures.
+        One result naming any figure that is neither sourced nor derivable.
     """
-    blob = _digits(transcript.results_blob())
-    asked = _digits(transcript.question)
+    flat, series = transcript.result_numbers()
+    asked = {float(n) for n in _digits(transcript.question) if n}
     ungrounded = []
     for number in re.findall(r"\d[\d,]*", transcript.answer):
         bare = number.replace(",", "")
-        if len(bare) < MIN_GROUNDED_DIGITS or bare in blob or bare in asked:
+        if len(bare) < MIN_GROUNDED_DIGITS:
+            continue
+        value = float(bare)
+        if value in flat or value in asked or _derivable(value, series):
             continue
         ungrounded.append(bare)
     return [
@@ -316,12 +465,62 @@ def grounded_numbers(transcript: Transcript, _spec: bool) -> list[CheckResult]:
             name="grounded_numbers",
             passed=not ungrounded,
             detail=(
-                f"not found in any tool result: {sorted(set(ungrounded))}"
+                f"neither returned nor derivable from a returned series: {sorted(set(ungrounded))}"
                 if ungrounded
-                else "every figure traced to a result"
+                else "every figure sourced or derivable"
             ),
         )
     ]
+
+
+def _derivable(target: float, series: Sequence[Sequence[float]]) -> bool:
+    """Return whether a figure follows from one of the result's own series.
+
+    Covers the three operations a data answer actually performs: a total, a
+    change between two periods, and that change as a percentage. Deliberately
+    not a general search for any arithmetic that reaches the number -- with
+    enough values that succeeds for almost anything, and a check that passes
+    everything is not a check.
+
+    Args:
+        target: The figure from the answer.
+        series: One list of values per repeated key in the results.
+
+    Returns:
+        True if some series totals to it, or two of its values differ by it, or
+        relate to it as a percentage.
+    """
+    for values in series:
+        if not values or len(values) > MAX_SERIES:
+            continue
+        if _close(sum(values), target):
+            return True
+        for a in values:
+            for b in values:
+                if _close(abs(a - b), target):
+                    return True
+                if b and (
+                    _close(round(abs(a - b) / b * 100), target)
+                    or _close(round(a / b * 100), target)
+                ):
+                    return True
+    return False
+
+
+def _close(value: float, target: float) -> bool:
+    """Return whether two figures agree once rounding is allowed.
+
+    A percentage the model rounded, or a total it reported to the nearest whole
+    number, should not read as invention.
+
+    Args:
+        value: The computed figure.
+        target: The figure from the answer.
+
+    Returns:
+        True if they differ by at most one.
+    """
+    return abs(value - target) <= 1
 
 
 def _digits(text: str) -> set[str]:
@@ -344,6 +543,8 @@ CHECKS = {
     "avoids_tool": avoids_tool,
     "calls_before": calls_before,
     "tool_args": tool_args,
+    "result_filters": result_filters,
+    "answer_contains_any": answer_contains_any,
     "recovers_from_error": recovers_from_error,
     "no_error": no_error,
     "answer_contains": answer_contains,
@@ -375,6 +576,7 @@ def run_checks(transcript: Transcript, expect: dict[str, Any]) -> list[CheckResu
 
 __all__ = [
     "CHECKS",
+    "MAX_SERIES",
     "MIN_GROUNDED_DIGITS",
     "CheckResult",
     "ToolCall",

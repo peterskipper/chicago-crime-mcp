@@ -32,7 +32,7 @@ import yaml
 from evals.checks import CheckResult, ToolCall, Transcript, run_checks
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 #: Where the cases live.
 CASES_PATH = Path(__file__).parent / "cases.yaml"
@@ -324,11 +324,16 @@ async def preflight() -> list[str]:
     return findings
 
 
-async def run_suite(cases: Sequence[Case]) -> list[CaseResult]:
+async def run_suite(
+    cases: Sequence[Case], on_progress: Callable[[int, int, CaseResult], None] | None = None
+) -> list[CaseResult]:
     """Run every case against a freshly built server.
 
     Args:
         cases: What to run.
+        on_progress: Called with ``(index, total, result)`` as each case
+            finishes. A callback rather than printing from here, so the harness
+            stays usable from something that is not a terminal.
 
     Returns:
         One graded result per case, in order.
@@ -344,15 +349,16 @@ async def run_suite(cases: Sequence[Case]) -> list[CaseResult]:
 
     async with Client(app) as mcp:
         tools = to_anthropic_tools(await mcp.list_tools())
-        for case in cases:
+        for index, case in enumerate(cases, start=1):
             transcript = await run_case(client, mcp, tools, case)
-            results.append(
-                CaseResult(
-                    case=case,
-                    transcript=transcript,
-                    checks=run_checks(transcript, case.expect),
-                )
+            result = CaseResult(
+                case=case,
+                transcript=transcript,
+                checks=run_checks(transcript, case.expect),
             )
+            results.append(result)
+            if on_progress is not None:
+                on_progress(index, len(cases), result)
     return results
 
 

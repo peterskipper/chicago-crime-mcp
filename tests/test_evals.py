@@ -211,6 +211,159 @@ def test_grounded_numbers_does_not_read_a_failed_calls_payload():
     assert not _passed(checks.grounded_numbers(transcript, True))
 
 
+def test_result_filters_reads_the_normalized_value_not_the_typed_one():
+    """The whole reason this check exists, taken from a real run.
+
+    A model sent ``geography_values: [18]``; the server zero-padded it to "018"
+    and answered correctly. Asserting the wire form failed a run that did
+    everything right.
+    """
+    transcript = _transcript(
+        [(
+            "search_incidents",
+            {"geography": "district", "geography_values": [18]},
+            True,
+            {"filters_applied": {"geography": "district", "geography_values": ["018"]}},
+        )]
+    )
+    spec = {"search_incidents": {"geography": "district", "geography_values": ["018"]}}
+    assert _passed(checks.result_filters(transcript, spec))
+
+
+def test_result_filters_still_fails_on_the_wrong_district():
+    """The negative half: type-tolerance must not become value-tolerance."""
+    transcript = _transcript(
+        [("search_incidents", {}, True, {"filters_applied": {"geography_values": ["007"]}})]
+    )
+    assert not _passed(
+        checks.result_filters(transcript, {"search_incidents": {"geography_values": ["018"]}})
+    )
+
+
+def test_result_filters_does_not_collapse_zero_padding():
+    """'18' and '018' are genuinely different; only int-vs-str is ignored."""
+    transcript = _transcript(
+        [("search_incidents", {}, True, {"filters_applied": {"geography_values": ["18"]}})]
+    )
+    assert not _passed(
+        checks.result_filters(transcript, {"search_incidents": {"geography_values": ["018"]}})
+    )
+
+
+def test_result_filters_fails_when_the_envelope_echoed_nothing():
+    transcript = _transcript([("search_incidents", {}, True, {})])
+    assert not _passed(
+        checks.result_filters(transcript, {"search_incidents": {"geography": "district"}})
+    )
+
+
+def test_answer_contains_any_accepts_alternative_phrasings():
+    """A fact with several natural wordings should not be graded on phrasing."""
+    for wording in ("the most recent 7 days", "a 7-day lag", "seven days behind", "about a week"):
+        transcript = _transcript(answer=f"The feed excludes {wording}.")
+        assert _passed(
+            checks.answer_contains_any(
+                transcript, ["7 day", "7-day", "seven day", "week", "most recent"]
+            )
+        ), wording
+
+
+def test_answer_contains_any_fails_when_none_appear():
+    transcript = _transcript(answer="There were 12 robberies.")
+    assert not _passed(checks.answer_contains_any(transcript, ["7 day", "week"]))
+
+
+# --- grounding: derivation is not invention ----------------------------------
+
+
+def _buckets(values, start_year=2016):
+    """A result shaped like an aggregate response.
+
+    Periods are real dates, because that is what the tool returns and it matters
+    here: a year mentioned in an answer is a four-digit number like any other,
+    and it is grounded precisely when the results (or the question) contain it.
+    """
+    return {
+        "data": {
+            "buckets": [
+                {"period": f"{start_year + i}-01-01", "incidents": v}
+                for i, v in enumerate(values)
+            ]
+        }
+    }
+
+
+def test_a_year_named_in_the_answer_is_grounded_by_the_periods_returned():
+    """A year is a four-digit number; it is sourced when the buckets carry it."""
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets([7052, 6828]))],
+        answer="In 2016 there were 7,052 and in 2017 there were 6,828.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_a_total_summed_from_buckets_is_grounded():
+    """The commonest correct thing an answer does, and the original false positive."""
+    values = [4081, 4210, 4055, 3990, 4150, 4000]
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets(values))],
+        answer=f"Thefts totalled {sum(values):,} over the six months.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_a_difference_between_two_periods_is_grounded():
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets([7052, 6828]))],
+        answer="Ward 3 fell by 224 offenses.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_a_rounded_percentage_is_grounded():
+    """Rounding to a whole percent must not read as invention."""
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets([7052, 6828]))],
+        answer="That is 97% of the 2016 level.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_a_zero_padded_code_returned_as_a_string_is_grounded():
+    """IUCR codes arrive as strings; they are figures the model was handed."""
+    transcript = _transcript(
+        calls=[("describe_schema", {}, True, {"codes": [{"iucr": "0325"}]})],
+        answer="IUCR 0325 covers aggravated vehicular hijacking.",
+    )
+    assert _passed(checks.grounded_numbers(transcript, True))
+
+
+def test_invention_is_still_caught_among_real_figures():
+    """The point of the check survives the loosening."""
+    values = [4081, 4210, 4055]
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets(values))],
+        answer=f"There were {sum(values):,} thefts, of which 9,912 were on the North Side.",
+    )
+    results = checks.grounded_numbers(transcript, True)
+    assert not _passed(results)
+    assert "9912" in results[0].detail
+
+
+def test_a_long_series_is_not_scanned_pairwise():
+    """Guards the loosening from becoming vacuous.
+
+    With enough values almost any number is reachable by some pair, so the
+    pairwise scan is capped -- otherwise the check would pass everything.
+    """
+    long_series = list(range(checks.MAX_SERIES + 20))
+    transcript = _transcript(
+        calls=[("aggregate_incidents", {}, True, _buckets(long_series))],
+        answer="There were 8,675,309 offenses.",
+    )
+    assert not _passed(checks.grounded_numbers(transcript, True))
+
+
 # --- the case file -----------------------------------------------------------
 
 
