@@ -233,12 +233,131 @@ by measurement rather than by design:
   changes is that it is paid where nobody is waiting instead of on a caller's
   first question, and again after each nightly swap.
 
-### Observability
-Every tool call is logged as structured JSON (trace id, args, resolved query
-plan, row count, latency, compacted result). A batch job rolls those logs into
-**outcome/failure telemetry** — empty-result rates, `resolve_neighborhood`
-misses, malformed-arg rates — treating failures as the product signal. (The
-server only ever sees structured tool arguments, never the user's raw prompt.)
+### Observability: the envelope is also the telemetry schema
+
+Every tool call is written to a JSON-lines log, one flat object per call. What
+makes that cheap is a property the tool surface already had: **every tool returns
+an envelope** naming which store answered and why, how many rows came back,
+whether the page was capped, and which qualifications applied — because a model
+reading a result it cannot verify needs all of that. Those are the same facts an
+operator needs, so one middleware reads them back out of the serialized response.
+Six tools returning four payload shapes are covered by one extractor, and nothing
+in `server/tools/` knows telemetry exists.
+
+```json
+{"ts": "2026-08-24T18:02:11.417+00:00", "call_id": "9f2c…", "session_id": "s-14",
+ "tool": "aggregate_incidents", "duration_ms": 27.4, "outcome": "ok",
+ "args": {"geography": "community_area", "geography_values": [8], "start": "2024-01-01"},
+ "route_store": "duckdb", "route_tier": "rollup", "route_table": "monthly_rollup",
+ "route_elapsed_ms": 9.1, "row_count": 12, "truncated": false, "cursor_issued": false,
+ "taxonomy_mode": "source", "warning_codes": ["provisional"], "result_bytes": 5602,
+ "resolution_kind": null, "error_code": null}
+```
+
+#### Failures are the signal, and the protocol makes that unavoidable
+
+MCP hands a server **structured arguments and nothing else** — no prompt, no
+conversation, no user. The model does the natural-language parse client-side. So
+"what do people ask about" is not a question this data can answer, and inferring
+it would be invention. What the arguments *do* show is where the surface let a
+model down. `chicago-crime-telemetry` rolls the logs up with DuckDB — six
+reports, all variations on that theme:
+
+| Report | The question it answers |
+|---|---|
+| Calls by tool | Where the traffic is, and how often each tool disappoints |
+| Empty results by filter combination | A combination at 100% has *never* returned a row — a tool description inviting a question the data cannot answer |
+| **`resolve_neighborhood` misses** | The alias backlog, ranked by demand and by distinct sessions |
+| Malformed arguments by field | Which argument the model gets wrong, and what it invents instead |
+| Latency by route | Where the time goes, split by the route actually taken |
+| Warning frequency | A warning on nearly every call has stopped carrying information |
+
+Three details that took some getting right:
+
+- **The alias backlog needs a column of its own.** A `resolve_neighborhood` call
+  for "Bronzeville" *succeeds* — it returns candidates flagged as guesses the
+  model was told not to filter on. Counting errors would miss almost all of it,
+  so `resolution_kind` is recorded per call and a soft miss is as visible as a
+  hard one. The report emits a CSV shaped like `reference/neighborhood_aliases.csv`
+  with the targets **left blank**: deciding what Bronzeville means is a judgement
+  about Chicago, and the job has no business guessing at it.
+- **Three kinds of error, kept apart.** A teaching error is the self-correcting
+  loop working. `schema_validation` means the arguments never matched the
+  published JSON Schema, so the tool was never entered — that points at the
+  schema rather than at the offense vocabulary. `unhandled` is a bug. An error
+  rate that mixes the three is uninterpretable.
+- **Overhead is reported separately from query time.** `duration_ms` covers the
+  whole call and `route_elapsed_ms` only the query; the gap is validation,
+  mapping and envelope construction. A slow serializer and a slow database want
+  opposite fixes, and the tool-level number alone cannot tell them apart.
+
+#### Privacy and retention
+
+The domain is investigative, so what is kept is a decision rather than a default.
+
+- **No prompt is ever captured**, because the server never receives one. Raw
+  natural language would have to be logged in a client layer, with consent — a
+  different system with different obligations.
+- **Arguments are logged verbatim, coordinates included.** A `nearby_incidents`
+  latitude/longitude is the *asker's* area of interest, not a victim's address,
+  and the source data is block-level by design — deriving a specific address
+  from it is prohibited and impossible. Rounding the coordinate would destroy
+  the "which places do we answer badly" signal for no privacy gain.
+- **Retention is a file operation.** One file per day, so a retention policy is
+  `find … -mtime +N -delete` rather than a migration. Nothing here is written to
+  a database, which is one of the reasons it is not.
+- **Off with one variable** — `TELEMETRY_ENABLED=0` stops the file sink; the
+  one-line stderr summary is independent of it.
+
+```bash
+chicago-crime-telemetry                              # roll up TELEMETRY_LOG_DIR
+chicago-crime-telemetry data/telemetry \
+  --alias-backlog data/alias-backlog.csv             # + the curation stub
+```
+
+### Does any of it work? The eval harness
+
+The five affordances above are claims about how a *model* behaves. Unit tests
+prove each one is implemented; only a real model deciding what to call, reading
+what came back, and answering can show whether any of them work on something
+that has not read this README.
+
+`evals/` runs 19 natural-language questions through the Anthropic API against the
+real server, in-process, and grades **tool-call behaviour** rather than prose:
+which tool was reached for, what went in the arguments, in what order, whether an
+error taught it enough to retry. Each case is tagged with the affordance it is
+trying to break.
+
+The headline case is Bronzeville — a real, well-known Chicago neighborhood with
+no boundary of its own, which `difflib` answers with "Andersonville", 19.4 km
+away at the opposite end of the city, with a plausible number attached. The case
+asserts that `resolve_neighborhood` is called *before* any filter, that the
+answer names the community area it widened to, and that "Andersonville" never
+appears.
+
+```bash
+python -m evals --preflight        # check server, stores and cases — no API call
+python -m evals --list
+python -m evals --affordance "entity resolution"
+python -m evals --json runs/latest.json
+```
+
+A few deliberate choices. It is a **manual tool-use loop**, not the SDK's tool
+runner — the runner is less code and hides the thing being measured, since the
+transcript *is* the grade. A teaching error is handed back to the model as a
+`tool_result` with `is_error`, exactly as an MCP client would, because a harness
+that aborted on the first error would make the teaching-error affordance
+untestable. And there is **no system prompt** beyond one sentence: the server's
+own `INSTRUCTIONS` and tool docstrings are what is under test, so extra guidance
+here would grade a prompt this project does not ship.
+
+The checks are pure functions over a transcript and import no SDK, so the whole
+vocabulary is unit-tested offline and runs in `make ci` with no API key. That
+covers the two things most likely to be quietly wrong — a check that does not
+check what it says, and a case that asserts nothing. Loading the case file *is*
+the validation: an unknown check name raises rather than silently grading
+nothing, because an eval that quietly checks less than it claims is worse than no
+eval. Only the run itself costs money, and it is not in `make ci`.
 
 ## Data & provenance
 
@@ -516,14 +635,16 @@ label up from the code, so no analytic judgment is involved.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,store,server]"   # dev tooling + storage layer + MCP server
+pip install -e ".[dev,store,server,eval]"   # tooling + storage + server + evals
 cp .env.example .env             # then paste your Socrata app token
 ```
 
 The `store` extra pulls the Postgres drivers (`psycopg` + `psycopg-pool`); the
-`server` extra pulls `fastmcp` and `pydantic`. `duckdb` is a **core** dependency
-rather than an extra: ingest needs it for the point-in-polygon test that derives
-the `neighborhood` column, so a backfill cannot run without it.
+`server` extra pulls `fastmcp` and `pydantic`; `eval` pulls the Anthropic SDK,
+needed only to *run* the eval harness (its checks are tested without it).
+`duckdb` is a **core** dependency rather than an extra: ingest needs it for the
+point-in-polygon test that derives the `neighborhood` column, so a backfill
+cannot run without it.
 
 ### Running the MCP server
 
@@ -677,6 +798,7 @@ different plans.
 pytest                    # unit tests only (default; offline, no services needed)
 pytest -m integration     # need the storage stack up
 pytest -m spatial         # need DuckDB's spatial extension
+python -m evals           # the live eval harness: needs an API key and the stores
 ```
 
 The default run is hermetic: no network, no database. The two excluded markers
@@ -688,6 +810,12 @@ is missing.
 Integration tests run against a **dedicated `<db>_test` database** that is created
 on demand, so they never touch the data you've loaded into the dev database
 (override the target with `TEST_DATABASE_URL`).
+
+The evals are not a marker, they are a separate program: they make real API
+calls that cost real money, so they are never part of `pytest` or `make ci`.
+What *is* in `make ci` is the check vocabulary and the case file, tested
+offline — see "Does any of it work?" above. Run `python -m evals --preflight`
+first; it verifies everything except the model, for free.
 
 ### Explore the source data
 ```bash
@@ -707,8 +835,9 @@ src/chicago_crime_mcp/
   geo/         neighborhood polygons: point-in-polygon tagging (ingest) and
                name resolution (server)
   reference/   committed snapshots: IUCR codes, neighborhood boundaries + aliases
-  telemetry/   structured logging + failure telemetry
+  telemetry/   per-call JSON logging + the failure-telemetry rollup
 scripts/       data puller, reference refresh, Parquet migration, query-plan tool
+evals/         natural-language cases + the harness that grades tool-call behaviour
 tests/
 ```
 
@@ -721,5 +850,8 @@ tests/
   the result envelope, the teaching errors and `resolve_neighborhood`, which
   closes entity resolution. The Redis cache planned here was measured and cut —
   see "Why there is no cache"
-- [ ] **Phase 4** — observability, failure telemetry & tests
+- [x] **Phase 4** — observability, failure telemetry & evals — per-call
+  structured logging off the existing envelope, the six-report rollup with its
+  `resolve_neighborhood` alias backlog, and a live eval harness that grades
+  tool-call behaviour against the five affordances
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo
