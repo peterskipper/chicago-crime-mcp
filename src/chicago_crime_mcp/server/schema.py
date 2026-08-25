@@ -53,8 +53,21 @@ GEOGRAPHY_NOTES: dict[Geography, tuple[str, str, bool]] = {
         False,
     ),
     "community_area": (
-        "One of Chicago's 77 official community areas.",
+        "One of Chicago's 77 official community areas. Complete: every geocoded "
+        "incident has one.",
         "integer, 1-77",
+        True,
+    ),
+    "neighborhood": (
+        "One of Chicago's 98 named neighborhoods -- the geography people usually "
+        "mean, and much sharper than the community area containing it (Wicker Park "
+        "is about a fifth of West Town). Not a CPD field: derived by locating each "
+        "incident in the city's published boundaries, so it is null for roughly 2% "
+        "of rows that are ungeocoded or fall outside every boundary. Trade "
+        "precision against that completeness; community_area is the complete one. "
+        "Many well-known names -- Pilsen, Bronzeville, Boystown -- are not in the "
+        "98; call resolve_neighborhood to turn any name into the right filter.",
+        "string, the stored spelling of one of the 98 names (e.g. 'Wicker Park')",
         True,
     ),
 }

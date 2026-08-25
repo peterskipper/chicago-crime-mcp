@@ -9,10 +9,10 @@ The design goal is a *system*, not a demo: a small surface of typed,
 purpose-built tools with schema validation and deliberate query routing —
 explicitly **not** a "hand the LLM a SQL prompt" text-to-SQL agent.
 
-> **Status:** under construction. The ingest and storage layers are built and
-> loaded (2.88M incidents, 2015 – present), and the five MCP tools run against
-> them end to end. Still outstanding in Phase 3: `resolve_neighborhood`. The
-> planned Redis cache was measured and cut — see "Why there is no cache". See the
+> **Status:** Phase 3 complete. The ingest and storage layers are built and
+> loaded (2.88M incidents, 2015 – present), and all six MCP tools run against
+> them end to end. The planned Redis cache was measured and cut — see "Why there
+> is no cache". Next is Phase 4, observability and failure telemetry. See the
 > roadmap below.
 
 ## Architecture
@@ -58,9 +58,9 @@ something two hand-written queries have to keep true.
 The rollups are a latency tier, not a rescue for a slow query — and they are
 why there is no cache in front of them.
 
-**Rollup design** (`store/duckdb/rollups.sql`), five geography tables +
-provenance + two taxonomy-drift tables, 888k rows / 7.4 MB total, full rebuild
-in ~0.85 s over 2.88M incidents:
+**Rollup design** (`store/duckdb/rollups.sql`), six geography tables +
+provenance + two taxonomy-drift tables, roughly a million rows, full rebuild in
+about a second over 2.88M incidents:
 
 - **Month grain, not day.** Measured: day × type × beat yields 2.33M groups from
   2.88M rows — 81% of the row count, so no compression and no benefit.
@@ -156,29 +156,31 @@ and serving layer, so incidents are ingested locally and served with routing.
 
 ### The tool surface
 
-Five typed, purpose-built tools — no `run_sql` escape hatch. Every identifier
+Six typed, purpose-built tools — no `run_sql` escape hatch. Every identifier
 that reaches SQL comes from a closed mapping keyed by a `Literal`; every value is
 bound as a parameter.
 
 | tool | answers | store |
 | --- | --- | --- |
 | `describe_schema` | "what's in here, and what counts as a valid value" | DuckDB |
+| `resolve_neighborhood` | "where is the place they just named" | reference tables |
 | `get_incident` | "tell me about this specific offense" | Postgres |
 | `search_incidents` | "which offenses match these filters" | Postgres |
 | `aggregate_incidents` | "how many, and has it changed" | DuckDB |
 | `nearby_incidents` | "what happens around this point" | Postgres |
 
-`resolve_neighborhood` (colloquial name → official geography) is designed but not
-yet built; it needs an alias-table design pass rather than a quick implementation.
+`resolve_neighborhood` reads no incident data at all, and its envelope says so —
+`store: "reference"`. A name lookup and a query over 2.9M rows should not look
+alike in the routing story.
 
 ### Designed for an agent to use correctly and fast
 The tool surface bakes in five affordances:
 
 1. **Schema discovery** — `describe_schema` returns every closed set the other
    tools validate against, read from the data rather than from a constant: the
-   offense categories under both taxonomies, and every beat, district, ward and
-   community area that actually occurs. About 9 KB, so a model can afford to read
-   it first. It also publishes the geocode rate by offense type and the caps
+   offense categories under both taxonomies, and every beat, district, ward,
+   community area and neighborhood that actually occurs. About 11 KB, so a model
+   can afford to read it first. It also publishes the geocode rate by offense type and the caps
    requests are held to.
 2. **Teaching errors** — an invalid value raises a structured error naming the
    argument, echoing what it received, offering the nearest valid value, and
@@ -188,8 +190,14 @@ The tool surface bakes in five affordances:
    inferred from an empty result, because a filter list is an `OR`: one good
    value in `["BURGLARY", "BURGLERY"]` would otherwise return a confident page
    with the typo silently dropped.
-3. **Entity resolution** — `resolve_neighborhood` will map fuzzy names to official
-   geography instead of letting the model invent IDs. Not yet built.
+3. **Entity resolution** — `resolve_neighborhood` maps the name a person says to
+   the geography that answers it, instead of letting the model pick the
+   closest-looking value from a list. It returns the match *kind*, so an answer
+   that had to widen can be reported as wider: `exact` and `alias` are
+   polygon-backed, `containing` fell back to the surrounding community area, and
+   `suggestion` is a guess the caller must confirm rather than filter on. See
+   "Neighborhoods versus community areas" below for why guessing is unsafe here
+   and safe almost everywhere else.
 4. **Result envelopes** — every response echoes the filters *as actually applied
    after normalization* (a caller passing district `10` reads back `"010"`, so it
    can see its input was interpreted rather than ignored), the row count, a
@@ -236,8 +244,16 @@ server only ever sees structured tool arguments, never the user's raw prompt.)
 
 Source: **Crimes — 2001 to Present** (`ijzp-q8t2`) from the
 [Chicago Data Portal](https://data.cityofchicago.org/), reported incidents
-extracted from CPD's CLEAR system, plus boundary shapefiles (community areas,
-wards, police beats).
+extracted from CPD's CLEAR system, plus the city's published
+**Neighborhoods_2012b** boundaries (`y6yq-dbs2`) and community areas
+(`igwz-8jzy`).
+
+**Three columns are ours, not CPD's**, and the tools say so: `primary_type_canonical`
+and `stable_category` (see "On comparing crime over time"), and `neighborhood` —
+a point-in-polygon test against those 98 published boundaries, because the feed
+carries a beat, district, ward and community area but not the geography people
+actually name. All three are derived once at ingest and materialized, never
+re-derived by a store.
 
 **Coverage: 2,884,106 incidents, 2015-01-01 through 2026-07-22**, a contiguous
 12-year window ingested as one Parquet partition per year. The full dataset
@@ -257,6 +273,72 @@ output:
 - CPD states it **should not be used for comparison purposes over time**.
 - Addresses are shown at **block level** to protect victim privacy, and deriving
   specific addresses from map visualizations is **prohibited**.
+
+### Neighborhoods versus community areas
+
+Chicago has 77 official community areas and 98 published neighborhood
+boundaries, and they are not the same geography. The community area is what the
+feed carries; the neighborhood is what people say.
+
+**Why bother deriving a second one.** A community area is often much bigger than
+the neighborhood inside it. Of the 98, 36 are strictly smaller than the area
+containing them, and among those the median covers about a quarter of it — so
+answering from the community area is typically around four times too broad, and
+at the extreme far worse: Greektown is 1% of the Near West Side. Concretely,
+2025 robberies in Wicker Park: **50** in the neighborhood, **177** across all of
+West Town. Same question, an answer 3.5× too big.
+
+**The trade runs the other way on completeness.** `community_area` is on every
+row; `neighborhood` is null for 1.84% — about 1.5% have no coordinates at all,
+and the rest are geocoded into the lake, onto the airport, or just outside every
+boundary. So neither is the right default: the precise geography is incomplete
+and the complete one is coarse. Both are queryable, the null bucket is kept
+rather than dropped, and the envelope reports which was used.
+
+**They are also two different kinds of fact**, which is worth knowing before
+reconciling totals. `neighborhood` is geometry applied to the published
+coordinates. `community_area` is an administrative field recorded in CLEAR — and
+it does not always agree with the city's own community-area boundary. For the 59
+neighborhoods whose polygon *is* a community area, the two counts agree closely
+(median within a third of a percent), but Hermosa is 14% apart, and a
+point-in-polygon test against the community-area boundary reproduces our
+neighborhood figure exactly. The geometry is consistent; the administrative
+field differs.
+
+**Why fuzzy name matching is a trap here.** The other closed sets this server
+validates against are *complete* — every offense category and beat the data holds
+is in the list — so a near miss is a typo and suggesting the nearest value is the
+most useful thing an error can do. The set of 98 neighborhood names is
+*inherently incomplete*: Pilsen, Bronzeville, Back of the Yards and Boystown are
+real places, and only one of those has a boundary of its own. Run the same
+matcher on them and it answers with total confidence and total inaccuracy —
+**`Bronzeville` comes back as `Andersonville`, 19.4 km away at the opposite end
+of the city**, with a plausible incident count attached and nothing to tell a
+model it is wrong.
+
+So the same matcher is safe in one place and dangerous in the other, and
+`resolve_neighborhood` exists to keep them apart. It resolves through a ladder,
+and every answer names which rung it came from:
+
+| kind | means | you get |
+| --- | --- | --- |
+| `exact` | normalized match against the 98 (case, spacing and a leading "the" don't matter) | the neighborhood |
+| `alias` | curated pointer to one of the 98 — `Boys Town` → `Boystown` | the neighborhood |
+| `containing` | a real place with no boundary — `Pilsen` → Lower West Side | the **community area**, broader than asked |
+| `suggestion` | nothing matched; here is a guess, with its score | **confirm before using** |
+| miss | not close to anything | an error listing all 98 resolvable names |
+
+Curated aliases are the safety mechanism, not a convenience: an alias row is what
+stands between "Bronzeville" and Andersonville. The table is deliberately small
+and deliberately unfinished — there is no complete list of what Chicagoans call
+places — so Phase 4 treats resolution misses as the telemetry signal for what to
+add next.
+
+Six neighborhoods straddle two community areas (Englewood, Garfield Park,
+Humboldt Park, Jackson Park, Old Town, Streeterville). All six have boundaries,
+so `geography="neighborhood"` still answers them exactly; the split only matters
+when translating to a community area, and both areas are reported with their
+shares.
 
 ### On comparing crime over time
 
@@ -438,9 +520,10 @@ pip install -e ".[dev,store,server]"   # dev tooling + storage layer + MCP serve
 cp .env.example .env             # then paste your Socrata app token
 ```
 
-The `store` extra pulls the storage-layer drivers: `psycopg` + `psycopg-pool`
-(Postgres/PostGIS) and `duckdb`. The `server` extra pulls `fastmcp` and
-`pydantic`.
+The `store` extra pulls the Postgres drivers (`psycopg` + `psycopg-pool`); the
+`server` extra pulls `fastmcp` and `pydantic`. `duckdb` is a **core** dependency
+rather than an extra: ingest needs it for the point-in-polygon test that derives
+the `neighborhood` column, so a backfill cannot run without it.
 
 ### Running the MCP server
 
@@ -470,29 +553,137 @@ docker compose ps                # should read "Up (healthy)"
 - `StoreConfig.from_env()` defaults mirror the compose file, so a fresh checkout
   connects with no `.env` changes; production overrides `DATABASE_URL`.
 
-Load the Parquet dataset into Postgres:
+### Running the pipeline
+
+Ingest → store → serve. Each stage writes what the next one reads, and **Parquet
+is the source of truth**: both stores are rebuilt from it, so neither can drift
+from the other or invent a column of its own.
+
+From a clean checkout, in order:
 
 ```bash
-chicago-crime-load                       # full refresh (rebuild the incidents table)
-chicago-crime-load --mode upsert --years 2025 2026   # merge only changed partitions
+# 1. Backfill Socrata -> partitioned Parquet (data/parquet/year=YYYY/part.parquet).
+#    Defaults to 2015 through the current year. Checkpointed per year: a re-run
+#    skips any year whose partition already holds the row count the API reports,
+#    so an interrupted pull resumes cheaply. Needs SOCRATA_APP_TOKEN in .env --
+#    without one you are on the shared anonymous throttle and will see 429s.
+chicago-crime-ingest backfill
+chicago-crime-ingest backfill --start-year 2015 --end-year 2015 --force
+
+# 2. Parquet -> Postgres. Full refresh rebuilds the incidents table from scratch
+#    (~75s for 2.9M rows); upsert merges only the partitions that changed.
+chicago-crime-load
+chicago-crime-load --mode upsert --years 2025 2026
+
+# 3. Parquet -> DuckDB rollups. No services needed (DuckDB is embedded); writes
+#    to DUCKDB_PATH, default data/duckdb/crime.duckdb. Always rebuilds from
+#    scratch, so it is safe to re-run at any time (~1s).
+chicago-crime-rollup
+
+# 4. Serve.
+chicago-crime-server
 ```
 
-Build the DuckDB OLAP rollups from the same Parquet (no services needed — DuckDB
-is embedded; writes to `DUCKDB_PATH`, default `data/duckdb/crime.duckdb`):
+Step 1 derives three columns the incident feed does not carry —
+`primary_type_canonical`, `stable_category` and `neighborhood` — and lands them
+in Parquet. They are computed **once, at ingest**, never re-derived by a store.
+That is what stops Postgres and DuckDB disagreeing about what a burglary is or
+where Wicker Park ends. `chicago-crime-ingest` needs DuckDB's spatial extension
+for the neighborhood tag; it downloads on first use and caches to
+`~/.duckdb/extensions`.
+
+#### Keeping it current
+
+The nightly path pulls only rows whose `updated_on` moved past the stored
+watermark, rewrites the affected year partitions, then merges those years:
 
 ```bash
-chicago-crime-rollup                     # full rebuild of all five rollup tables
+chicago-crime-ingest incremental        # --overlap-days N re-pulls N days before
+                                        # the watermark, to catch late edits
+chicago-crime-load --mode upsert
+chicago-crime-rollup
 ```
 
-Run it after each ingest; it always rebuilds from scratch, so it is safe to
-re-run at any time.
+`incremental` only touches years that already have a partition. Updates to years
+you have never backfilled are counted and skipped, so run a backfill first if you
+widen the window — including at New Year, when the current year has no partition
+yet.
+
+#### Reference data and migrations
+
+Two snapshots are committed so ingest is reproducible and works offline: the IUCR
+code table and the neighborhood boundaries. Refresh them only deliberately —
+both scripts hit Socrata, and the curated columns they carry are ours, not the
+city's (see `src/chicago_crime_mcp/reference/`).
+
+```bash
+python scripts/build_neighborhood_reference.py --dry-run   # 98 polygons + containment table
+python scripts/retag_parquet.py --dry-run                  # report; drop the flag to write
+```
+
+`retag_parquet.py` is how a **new or changed derived column** reaches partitions
+already on disk, without re-pulling millions of rows to recompute something local.
+It runs the same `schema.prepare()` pipeline ingest runs, so a migrated partition
+is what a fresh backfill would have written, and it reports per-column change
+counts before writing anything — a re-run with nothing to do says so. Reload the
+stores afterwards (`chicago-crime-load` then `chicago-crime-rollup`).
+
+### Measuring a query, and deciding about an index
+
+Every "we measured it" claim in `store/postgres/schema.sql` came from
+`scripts/explain_query.py`. It exists so those comments can explain *why* a plan
+is fast or slow without freezing millisecond figures into a file where they rot —
+when you want numbers, run it and get today's numbers on your machine.
+
+```bash
+python scripts/explain_query.py          # worked example: the neighborhood index decision
+
+python scripts/explain_query.py     --sql "SELECT id FROM incidents WHERE ward = %s AND date >= %s AND date < %s            ORDER BY date DESC, id DESC LIMIT 51"     --param 42 --param '"2025-01-01"' --param '"2026-01-01"'     --index "(ward, date DESC, id DESC)"
+```
+
+It runs the query under `EXPLAIN (ANALYZE, BUFFERS)` several times, builds each
+candidate index, measures again, and drops it. `--drop NAME` measures without an
+index that already exists — how you re-ask a question you have already answered.
+`--trials N` rebuilds a candidate repeatedly to check the planner's choice is
+stable rather than sitting on a cost crossover.
+
+Four things the tool is built around, which are most of what there is to know:
+
+- **Read buffers, not milliseconds.** A buffer is one 8 KB page touched. It is a
+  property of the plan and barely moves between runs, while milliseconds depend
+  on your cache and your disk. Two queries at the same wall time touching 200 and
+  68,000 pages are not equally good — the second is fine only while everything
+  fits in RAM.
+- **`rows_removed_by_filter` is the tell.** It counts rows fetched and thrown
+  away. Returning 51 rows after discarding 77,000 means the index that query
+  wants does not exist, or the planner declined to use it.
+- **Measure the span people actually ask for.** The biggest trap, and the one
+  that nearly produced the wrong answer for `neighborhood`: an index can look
+  worthless over eleven years and be worth two orders of magnitude over one,
+  because what decides it is how many rows match *inside the date window*.
+- **Prefer a composite that also delivers the sort order.** For
+  `WHERE x = ? ORDER BY date DESC, id DESC LIMIT n`, an index on
+  `(x, date DESC, id DESC)` lets the planner stop after n rows. A bare `(x)` only
+  supports a bitmap scan plus a sort, so it reads every matching row in the span
+  first — often much worse despite being much smaller.
+
+The module docstring carries the longer version, including why the connection
+sets `prepare_threshold=None` and why parameters and literals can produce
+different plans.
 
 ### Running the tests
 
 ```bash
-pytest                    # unit tests only (default; no services needed)
-pytest -m integration     # integration tests (need the storage stack up)
+pytest                    # unit tests only (default; offline, no services needed)
+pytest -m integration     # need the storage stack up
+pytest -m spatial         # need DuckDB's spatial extension
 ```
+
+The default run is hermetic: no network, no database. The two excluded markers
+have genuinely different prerequisites, which is why they are separate —
+`integration` wants a live Postgres, `spatial` wants an extension that downloads
+on first use and then caches. Either skips with a clear message if what it needs
+is missing.
 
 Integration tests run against a **dedicated `<db>_test` database** that is created
 on demand, so they never touch the data you've loaded into the dev database
@@ -513,9 +704,11 @@ src/chicago_crime_mcp/
   store/       Postgres/PostGIS, DuckDB + query routing
   server/      MCP tools (typed, constrained, purpose-built) + envelope, errors,
                connection lifecycle
-  geo/         boundary shapefiles + neighborhood resolution
+  geo/         neighborhood polygons: point-in-polygon tagging (ingest) and
+               name resolution (server)
+  reference/   committed snapshots: IUCR codes, neighborhood boundaries + aliases
   telemetry/   structured logging + failure telemetry
-scripts/       exploration-stage data puller
+scripts/       data puller, reference refresh, Parquet migration, query-plan tool
 tests/
 ```
 
@@ -524,9 +717,9 @@ tests/
 - [x] **Phase 0** — project scaffolding
 - [x] **Phase 1** — ingestion (explore field shapes, then checkpointed backfill)
 - [x] **Phase 2** — storage & query routing (Postgres/PostGIS, DuckDB)
-- [ ] **Phase 3** — MCP tool surface + the five agent affordances — the five
-  tools, the result envelope and the teaching errors are built;
-  `resolve_neighborhood` is still outstanding. The Redis cache planned here was
-  measured and cut — see "Why there is no cache" 
+- [x] **Phase 3** — MCP tool surface + the five agent affordances — six tools,
+  the result envelope, the teaching errors and `resolve_neighborhood`, which
+  closes entity resolution. The Redis cache planned here was measured and cut —
+  see "Why there is no cache"
 - [ ] **Phase 4** — observability, failure telemetry & tests
 - [ ] **Phase 5** — deploy to Railway + Anthropic API MCP connector demo

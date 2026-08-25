@@ -15,19 +15,32 @@ import pandas as pd
 
 from chicago_crime_mcp.ingest import backfill
 from chicago_crime_mcp.ingest.socrata import SodaClient
+from tests.helpers import StubLocator
 
 # Two rows share IUCR 0281 under the two drifted labels; one is a plain THEFT.
+# The three coordinates are distinct and the third is deliberately unlocatable,
+# so a test cannot pass by tagging every row the same way or by tagging none.
 ROWS = [
     {"id": "1", "iucr": "0810", "primary_type": "THEFT",
-     "date": "2023-05-01T00:00:00.000", "arrest": "false", "beat": "0111"},
+     "date": "2023-05-01T00:00:00.000", "arrest": "false", "beat": "0111",
+     "latitude": "41.9088", "longitude": "-87.6796"},
     {"id": "2", "iucr": "0281", "primary_type": "CRIM SEXUAL ASSAULT",
-     "date": "2023-06-01T00:00:00.000", "arrest": "true", "beat": "0222"},
+     "date": "2023-06-01T00:00:00.000", "arrest": "true", "beat": "0222",
+     "latitude": "41.8781", "longitude": "-87.6298"},
     {"id": "3", "iucr": "0281", "primary_type": "CRIMINAL SEXUAL ASSAULT",
-     "date": "2023-07-01T00:00:00.000", "arrest": "false", "beat": "0333"},
+     "date": "2023-07-01T00:00:00.000", "arrest": "false", "beat": "0333",
+     "latitude": "41.8800", "longitude": "-87.5500"},
 ]
 REF = {"0810": "THEFT", "0281": "CRIMINAL SEXUAL ASSAULT"}
 # No override for either code, so stable_category mirrors the canonical type.
 CURATED: dict[str, str] = {}
+# Row 3's coordinates are absent on purpose: five km out into Lake Michigan.
+POLYGONS = {(41.9088, -87.6796): "Wicker Park", (41.8781, -87.6298): "Loop"}
+
+
+def locator() -> StubLocator:
+    """A fresh stub locator over POLYGONS."""
+    return StubLocator(POLYGONS)
 
 
 def crime_client(rows, count_override=None):
@@ -63,7 +76,9 @@ def test_year_where_bounds_the_year():
 def test_backfill_year_writes_partition_and_canonicalizes(tmp_path):
     client = crime_client(ROWS)
     # page_size=2 forces two keyset pages (2 rows, then 1).
-    result = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    result = backfill.backfill_year(
+        client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2
+    )
 
     assert result == {"year": 2023, "rows": 3, "expected": 3, "skipped": False}
     out = backfill.partition_path(2023, base=tmp_path)
@@ -82,22 +97,52 @@ def test_backfill_year_writes_partition_and_canonicalizes(tmp_path):
     assert df["id"].dtype == "Int64"
     assert df["arrest"].dtype == "boolean"
     assert df.sort_values("id")["beat"].tolist() == ["0111", "0222", "0333"]
+    # Neighborhood is derived at ingest too, and the three rows disagree: two
+    # distinct names and one unlocatable row, so this cannot pass by tagging
+    # everything alike or by tagging nothing.
+    ordered = df.sort_values("id")
+    assert ordered["neighborhood"].tolist()[:2] == ["Wicker Park", "Loop"]
+    assert ordered["neighborhood"].isna().tolist() == [False, False, True]
+    assert df["neighborhood"].dtype == "string"
+
+
+def test_backfill_year_tags_every_row_it_writes(tmp_path):
+    """The pipeline must call the locator, not quietly write the column as null."""
+    stub = locator()
+    backfill.backfill_year(crime_client(ROWS), 2023, REF, CURATED, stub, base=tmp_path)
+    assert stub.calls == 1
+
+
+def test_backfill_closes_the_polygons_it_opened(tmp_path, monkeypatch):
+    """An injected locator belongs to the caller; a loaded one does not."""
+    stub = locator()
+    monkeypatch.setattr(backfill.NeighborhoodBoundaries, "load", lambda: stub)
+    backfill.backfill(crime_client(ROWS), 2023, 2023, base=tmp_path)
+    assert stub.closed, "a locator we loaded must be closed"
+
+    reused = locator()
+    backfill.backfill(
+        crime_client(ROWS), 2023, 2023, base=tmp_path, force=True, boundaries=reused
+    )
+    assert not reused.closed, "an injected locator must be left open"
 
 
 def test_backfill_year_skips_when_complete(tmp_path):
     client = crime_client(ROWS)
-    backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    backfill.backfill_year(client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2)
     # second run: partition already holds all 3 rows -> skipped, not re-pulled.
-    again = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    again = backfill.backfill_year(
+        client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2
+    )
     assert again["skipped"] is True
     assert again["rows"] == 3
 
 
 def test_backfill_year_force_repulls(tmp_path):
     client = crime_client(ROWS)
-    backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    backfill.backfill_year(client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2)
     forced = backfill.backfill_year(
-        client, 2023, REF, CURATED, base=tmp_path, page_size=2, force=True
+        client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2, force=True
     )
     assert forced["skipped"] is False
     assert forced["rows"] == 3
@@ -111,7 +156,9 @@ def test_backfill_year_repulls_on_count_mismatch(tmp_path):
 
     # API reports 3 -> mismatch with the 1-row partition -> re-pull to 3.
     client = crime_client(ROWS)
-    result = backfill.backfill_year(client, 2023, REF, CURATED, base=tmp_path, page_size=2)
+    result = backfill.backfill_year(
+        client, 2023, REF, CURATED, locator(), base=tmp_path, page_size=2
+    )
     assert result["skipped"] is False
     assert result["rows"] == 3
     assert len(pd.read_parquet(out)) == 3
@@ -119,7 +166,7 @@ def test_backfill_year_repulls_on_count_mismatch(tmp_path):
 
 def test_backfill_range_loops_years(tmp_path):
     client = crime_client(ROWS)
-    results = backfill.backfill(client, 2022, 2023, base=tmp_path)
+    results = backfill.backfill(client, 2022, 2023, base=tmp_path, boundaries=locator())
     assert [r["year"] for r in results] == [2022, 2023]
     assert all(r["rows"] == 3 for r in results)
     assert (tmp_path / "year=2022" / "part.parquet").exists()

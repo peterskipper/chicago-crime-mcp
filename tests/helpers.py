@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -40,6 +41,9 @@ SCHEMA = pa.schema(
         ("longitude", pa.float64()),
         ("primary_type_canonical", pa.string()),
         ("stable_category", pa.string()),
+        # Nullable, unlike the other derived columns: ~1.8% of real rows have no
+        # coordinates or fall outside every polygon.
+        ("neighborhood", pa.string()),
     ]
 )
 
@@ -67,6 +71,12 @@ def row(**overrides) -> dict:
        everything" from "the filter was never applied". The same reasoning
        applies to any low-variety default: ``arrest``, ``domestic`` and the
        offense columns are constants here too.
+
+       ``neighborhood`` is the newest such default and carries an extra trap:
+       it is the only geography that can be **null**, so a fixture of nothing but
+       the default never exercises the unlocatable rows that a
+       neighborhood-grouped aggregate must not silently drop. Give at least one
+       fixture row ``neighborhood=None``.
 
     Args:
         **overrides: Column values to replace in the default row.
@@ -96,6 +106,9 @@ def row(**overrides) -> dict:
         latitude=41.8781,
         longitude=-87.6298,
         primary_type_canonical="BATTERY",
+        # Consistent with the default coordinates above, which are State and
+        # Madison. Change one and change the other.
+        neighborhood="Loop",
     )
     base.update(overrides)
     base.setdefault("stable_category", base["primary_type_canonical"])
@@ -117,3 +130,57 @@ def write_partition(base: Path, year: int, rows: list[dict]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(rows, schema=SCHEMA), path)
     return path
+
+
+class StubLocator:
+    """A :class:`~chicago_crime_mcp.ingest.schema.PointLocator` with no geometry.
+
+    Lets a test exercise the ingest pipeline without DuckDB's spatial extension,
+    which downloads on first use and would drag the whole ingest suite behind the
+    ``spatial`` marker. Points not in the lookup come back null, which is how a
+    test reaches the unlocatable path deliberately.
+
+    Attributes:
+        calls: How many times :meth:`locate` ran, so a test can assert the
+            pipeline actually invoked it rather than passing by omission.
+        closed: Whether :meth:`close` was called. The real locator holds a DuckDB
+            connection, so who closes it -- the caller who injected one, or the
+            code that loaded one -- is behaviour worth pinning down.
+    """
+
+    def __init__(self, mapping: dict[tuple[float, float], str] | None = None) -> None:
+        """Build a locator over an explicit ``(latitude, longitude) -> name`` map.
+
+        Args:
+            mapping: Coordinates to neighborhood names. Empty means everything
+                is unlocatable.
+        """
+        self._mapping = mapping or {}
+        self.calls = 0
+        self.closed = False
+        #: The distinct names this locator can produce, mirroring
+        #: ``NeighborhoodBoundaries.names``.
+        self.names = tuple(sorted(set(self._mapping.values())))
+
+    def locate(self, latitude: pd.Series, longitude: pd.Series) -> pd.Series:
+        """Look each point up in the mapping, null where it is absent."""
+        self.calls += 1
+        lat = pd.to_numeric(latitude, errors="coerce")
+        lon = pd.to_numeric(longitude, errors="coerce")
+        return pd.Series(
+            [self._mapping.get((a, b)) for a, b in zip(lat, lon, strict=True)],
+            index=latitude.index,
+            dtype="string",
+        )
+
+    def close(self) -> None:
+        """Record that the owner released this locator."""
+        self.closed = True
+
+    def __enter__(self) -> StubLocator:
+        """Enter a context manager, returning ``self``."""
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Exit the context manager, closing the locator."""
+        self.close()

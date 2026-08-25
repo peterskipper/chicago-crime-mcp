@@ -65,6 +65,7 @@ ROLLUP_TABLES = (
     "rollup_beat",
     "rollup_district",
     "rollup_community_area",
+    "rollup_neighborhood",
     "rollup_ward",
 )
 

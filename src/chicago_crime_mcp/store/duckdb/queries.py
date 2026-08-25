@@ -70,6 +70,7 @@ _ROLLUP_TABLE: dict[Geography, str] = {
     "beat": "rollup_beat",
     "district": "rollup_district",
     "community_area": "rollup_community_area",
+    "neighborhood": "rollup_neighborhood",
     "ward": "rollup_ward",
 }
 

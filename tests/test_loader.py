@@ -108,6 +108,7 @@ def test_load_full_refresh_round_trip(tmp_path, pg_conn):
         "incidents_case_idx",
         "incidents_ptc_date_idx",
         "incidents_stable_date_idx",
+        "incidents_hood_date_idx",
     }
 
     # Full refresh is idempotent: a second run replaces, not appends.

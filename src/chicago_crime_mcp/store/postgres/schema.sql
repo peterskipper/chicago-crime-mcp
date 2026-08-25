@@ -1,7 +1,7 @@
 -- Postgres/PostGIS schema for the Chicago crime incidents table.
 --
 -- System of record for point lookups, case-number retrieval, radius/spatial
--- queries, and boundary containment. Columns mirror the 21 coerced fields the
+-- queries, and boundary containment. Columns mirror the 22 coerced fields the
 -- ingest layer lands in Parquet (see ingest/schema.py); `year` is deliberately
 -- absent (it is derivable from `date` and was a redundant Parquet partition key).
 --
@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS incidents (
     district                TEXT,
     ward                    SMALLINT,       -- domain ~1..50
     community_area          SMALLINT,       -- domain ~1..77
+
+    -- The sharper geography, and the only one the city does not supply: a
+    -- point-in-polygon tag against Chicago's 98 published neighborhood
+    -- boundaries, derived once at ingest (see geo/boundaries.py) and landed in
+    -- Parquet like the taxonomy columns, never re-derived here.
+    --
+    -- NULLABLE, unlike every other derived column: 1.84% of rows get no
+    -- neighborhood -- 1.55% are ungeocoded and a further ~0.3% are geocoded but
+    -- fall outside every polygon (the lake, the airport, the city edge). A NOT
+    -- NULL here would reject rows that are legitimately unlocatable. So
+    -- `community_area` remains the complete geography and this the precise one,
+    -- and an answer has to say which it used.
+    neighborhood            TEXT,
 
     -- Flags (real booleans in the feed; `domestic` = Illinois Domestic Violence
     -- Act qualifying, `arrest` = an arrest was made).
@@ -106,12 +119,50 @@ CREATE INDEX IF NOT EXISTS incidents_ptc_date_idx
 CREATE INDEX IF NOT EXISTS incidents_stable_date_idx
     ON incidents (stable_category, date DESC, id DESC);
 
--- Deferred, and now checked rather than assumed -- beat, district,
--- community_area and ward stay unindexed. A (community_area, date DESC, id DESC)
--- composite was built and measured: the planner ignored it entirely, reading the
--- same pages by the same plan, for another large index. These columns are
--- low-cardinality (community_area has ~77 values over millions of rows), so a
--- filter on one still matches a big fraction of the table and the date index
--- plus a sort already wins. A bare (date DESC, id DESC) was similarly not worth
--- its size -- `incidents_date_idx` plus an Incremental Sort covers that shape
--- already. Revisit only for a query shape that actually measures badly.
+-- neighborhood gets the same treatment, for the reason given above: same
+-- predicate-plus-keyset shape, so the index has to satisfy the filter AND
+-- deliver the sort order for the planner to stop after n rows.
+--
+-- This was expected NOT to be worth building, by analogy to community_area
+-- below. Measured, it is the biggest index win in the schema -- two orders of
+-- magnitude on a selective neighborhood over a one-year window, and the analogy
+-- was simply wrong. What decides it is not how many distinct values a column
+-- has, but how many rows match INSIDE the requested date window, and a small
+-- neighborhood within one year is a far thinner slice than any community area
+-- over the same span.
+--
+-- Without it the plan is an Index Scan Backward on incidents_date_idx that
+-- discards tens of thousands of rows by filter to return one page of 51 --
+-- reading most of the heap to do it. With it, an index scan that stops at 51.
+-- The size is in line with the two indexes above.
+--
+-- Two caveats worth keeping. A bare (neighborhood) index is NOT a cheaper
+-- substitute despite being far smaller: it only supports a bitmap scan plus a
+-- sort, so it reads every matching row in the span before it can return a page.
+-- And over the widest spans this index is marginal -- the planner flips between
+-- using and ignoring it across ANALYZE runs, because walking date backwards
+-- finds 51 matches soon enough either way. That is fine; it is not the query
+-- anyone asks.
+--
+-- `python scripts/explain_query.py` reproduces the whole comparison on your own
+-- machine, which is why no millisecond figures are pinned here.
+CREATE INDEX IF NOT EXISTS incidents_hood_date_idx
+    ON incidents (neighborhood, date DESC, id DESC);
+
+-- Deferred, and checked rather than assumed -- beat, district, community_area
+-- and ward stay unindexed. A (community_area, date DESC, id DESC) composite was
+-- built and measured: the planner ignored it entirely, reading the same pages by
+-- the same plan, for another large index. The date index plus a sort already
+-- wins for a filter that still matches a big fraction of the table.
+--
+-- Re-measured when neighborhood was added, because the original explanation --
+-- "these columns are low-cardinality" -- turned out to be the wrong reason for
+-- the right conclusion. A bare (community_area) index is still ignored on both
+-- an 11-year and a one-year span, so the conclusion holds. But it does help a
+-- 90-day window, by roughly the margin neighborhood shows, so cardinality is not
+-- what settles it. Left unbuilt: one span of one shape does not earn the space.
+-- Re-check with scripts/explain_query.py before assuming either way.
+--
+-- A bare (date DESC, id DESC) was similarly not worth its size --
+-- `incidents_date_idx` plus an Incremental Sort covers that shape already.
+-- Revisit any of these for a query shape that actually measures badly.

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from chicago_crime_mcp.geo.boundaries import NeighborhoodBoundaries
 from chicago_crime_mcp.ingest import backfill, schema
 from chicago_crime_mcp.ingest.socrata import SodaClient
 
@@ -140,6 +141,7 @@ def incremental_sync(
     base: Path = backfill.PARQUET_DIR,
     state_path: Path = STATE_PATH,
     overlap: timedelta = DEFAULT_OVERLAP,
+    boundaries: schema.PointLocator | None = None,
 ) -> dict:
     """Pull rows updated since the watermark and merge them into partitions.
 
@@ -148,6 +150,10 @@ def incremental_sync(
         base: Root directory of the partitioned dataset.
         state_path: Path to the JSON state file holding the watermark.
         overlap: How far before the watermark to re-pull, to catch late edits.
+        boundaries: The neighborhood polygons. Loaded from the vendored file
+            when omitted, and only when there is something to tag; injectable so
+            a test can supply a stub instead of installing DuckDB's spatial
+            extension.
 
     Returns:
         A summary dict: ``pulled`` (rows fetched), ``cutoff`` (the ``updated_on``
@@ -193,10 +199,20 @@ def incremental_sync(
     }
 
     if len(pulled):
-        reference = schema.load_iucr_reference()
-        pulled = schema.add_canonical_primary_type(pulled, reference)
-        pulled = schema.add_stable_category(pulled, schema.load_stable_category_map())
-        pulled = schema.coerce_types(pulled)
+        # The same pipeline the backfill runs, so a partition written by a
+        # nightly sync is indistinguishable from one written by a full pull.
+        owned = NeighborhoodBoundaries.load() if boundaries is None else None
+        locator = boundaries if boundaries is not None else owned
+        try:
+            pulled = schema.prepare(
+                pulled,
+                schema.load_iucr_reference(),
+                schema.load_stable_category_map(),
+                locator,
+            )
+        finally:
+            if owned is not None:
+                owned.close()
         managed = managed_years(base)
         pyear = pulled["date"].dt.year
 

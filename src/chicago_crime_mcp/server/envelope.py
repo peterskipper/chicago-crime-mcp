@@ -66,8 +66,14 @@ WarningCode = Literal[
 ]
 
 #: Geographies whose boundaries have been redrawn inside the dataset's window.
-#: Community areas are the only stable long series -- see the README's "On
-#: comparing crime over time".
+#: Community areas are the only stable long series in the feed itself -- see the
+#: README's "On comparing crime over time".
+#:
+#: `neighborhood` is absent because it cannot drift: every year is tagged against
+#: one vendored boundary snapshot, so the outline is identical in 2015 and 2026
+#: by construction. That is a stronger guarantee than the feed's own geographies
+#: give, and a narrower one -- it means a genuine change to a neighborhood's
+#: real-world outline would not be reflected until the snapshot is refreshed.
 _UNSTABLE_GEOGRAPHIES: tuple[Geography, ...] = ("ward", "district", "beat")
 
 #: Share of rows from drifting codes below which the coverage warning is not
@@ -97,7 +103,11 @@ class RouteInfo(BaseModel):
     invented for the store that has no equivalent.
 
     Attributes:
-        store: ``postgres`` or ``duckdb``.
+        store: ``postgres``, ``duckdb``, or ``reference`` for an answer that read
+            no incident data at all -- resolve_neighborhood is served entirely
+            from the pinned boundary and alias tables. Saying so is the point: a
+            caller can tell a name lookup from a query over 2.9M rows, and the
+            routing story stays honest about the case where there is no query.
         tier: The DuckDB tier -- ``rollup`` for pre-summed months, ``scan`` for
             a live read that answers a span the month grain cannot express.
             None for Postgres.
@@ -107,7 +117,9 @@ class RouteInfo(BaseModel):
             mapping and envelope construction.
     """
 
-    store: Literal["postgres", "duckdb"] = Field(description="Which store answered.")
+    store: Literal["postgres", "duckdb", "reference"] = Field(
+        description="Which store answered. 'reference' means no incident data was read."
+    )
     tier: str | None = Field(default=None, description="Rollup tier, for the DuckDB path.")
     table: str | None = Field(default=None, description="The relation read.")
     reason: str = Field(description="Why the query routed here.")

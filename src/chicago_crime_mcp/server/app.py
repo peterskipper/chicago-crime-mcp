@@ -44,6 +44,7 @@ from chicago_crime_mcp.server.tools.aggregate_incidents import aggregate_inciden
 from chicago_crime_mcp.server.tools.describe_schema import describe_schema
 from chicago_crime_mcp.server.tools.get_incident import get_incident
 from chicago_crime_mcp.server.tools.nearby_incidents import nearby_incidents
+from chicago_crime_mcp.server.tools.resolve_neighborhood import resolve_neighborhood
 from chicago_crime_mcp.server.tools.search_incidents import search_incidents
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,15 @@ Choosing a tool:
   - "which offenses", "show me the reports"               -> search_incidents
   - "what happens around this address"                    -> nearby_incidents
   - "tell me about this specific one"                     -> get_incident
+  - any neighborhood name you have not seen in the schema -> resolve_neighborhood
+
+Neighborhood names need care. The data carries 98 named boundaries, which are
+not all the names Chicagoans use: Pilsen, Bronzeville and Back of the Yards are
+real places with no boundary of their own. Call resolve_neighborhood with the
+name rather than guessing the closest listed one -- the closest listed one can
+be at the other end of the city. It will tell you whether the answer is exact or
+whether it had to widen to the surrounding community area, which is a broader
+question than the one asked and should be reported as such.
 
 Every response carries the filters as actually applied, which store answered,
 which offense taxonomy was used, and any warnings. Read the warnings before
@@ -71,9 +81,10 @@ that were introduced or retired mid-span can move a series for administrative
 reasons.
 """.strip()
 
-#: The five tools, in the order a caller meets them.
+#: The six tools, in the order a caller meets them.
 TOOLS = (
     describe_schema,
+    resolve_neighborhood,
     get_incident,
     search_incidents,
     aggregate_incidents,

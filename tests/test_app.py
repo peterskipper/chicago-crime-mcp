@@ -37,6 +37,7 @@ def test_every_tool_is_registered(listed):
         "search_incidents",
         "aggregate_incidents",
         "nearby_incidents",
+        "resolve_neighborhood",
     }
     assert len(TOOLS) == len(listed)
 
@@ -69,7 +70,7 @@ def test_every_parameter_is_documented(listed):
         (
             "aggregate_incidents",
             "geography",
-            {"citywide", "beat", "district", "community_area", "ward"},
+            {"citywide", "beat", "district", "community_area", "neighborhood", "ward"},
         ),
     ],
 )

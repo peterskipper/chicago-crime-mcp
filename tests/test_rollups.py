@@ -27,8 +27,9 @@ def built(tmp_path):
     """Build rollups over a small fixture dataset; yield the open connection.
 
     The fixture rows deliberately cover every edge the SQL has to handle: two
-    months, two years, arrest/domestic/geocoded flags, null ward and community
-    area, and one beat recorded under two different districts.
+    months, two years, arrest/domestic/geocoded flags, null ward, community area
+    and neighborhood, two distinct neighborhoods among the rest, and one beat
+    recorded under two different districts.
     """
     _write_partition(
         tmp_path / "parquet",
@@ -39,7 +40,10 @@ def built(tmp_path):
             _row(id=1, date=datetime(2024, 1, 5), beat="2422", district="024", arrest=True),
             _row(id=2, date=datetime(2024, 1, 9), beat="2422", district="024", domestic=False),
             _row(id=3, date=datetime(2024, 1, 20), beat="2422", district="006", domestic=False),
-            # 2024-02, THEFT, ungeocoded + null ward/community_area.
+            # 2024-02, THEFT, ungeocoded + null ward/community_area/neighborhood.
+            # A row with no coordinates cannot have a neighborhood: the tag is a
+            # point-in-polygon test, so leaving the default here would model
+            # something that cannot occur and make the null-bucket check vacuous.
             _row(
                 id=4,
                 date=datetime(2024, 2, 2),
@@ -48,6 +52,7 @@ def built(tmp_path):
                 district="010",
                 ward=None,
                 community_area=None,
+                neighborhood=None,
                 latitude=None,
                 longitude=None,
                 domestic=False,
@@ -57,7 +62,10 @@ def built(tmp_path):
     _write_partition(
         tmp_path / "parquet",
         2025,
-        [_row(id=5, date=datetime(2025, 6, 1), arrest=True, domestic=False)],
+        # A second neighborhood, so a neighborhood-grouped assertion has
+        # something to distinguish. The default is "Loop"; this row is not.
+        [_row(id=5, date=datetime(2025, 6, 1), arrest=True, domestic=False,
+              neighborhood="Wicker Park")],
     )
 
     conn = rollups.connect(
@@ -151,12 +159,52 @@ def test_measures_sum_to_source_totals(built):
 
 
 def test_null_geography_keeps_its_own_bucket(built):
-    """The ungeocoded THEFT row has null ward/community_area; it must still be counted."""
-    for table, column in (("rollup_ward", "ward"), ("rollup_community_area", "community_area")):
+    """The ungeocoded THEFT row has null ward/community_area/neighborhood.
+
+    It must still be counted. This matters most for `neighborhood`, which is null
+    for close to 2% of real rows rather than a couple of hundred: a
+    neighborhood-grouped total that quietly dropped them would be short by that
+    much and look perfectly reasonable.
+    """
+    for table, column in (
+        ("rollup_ward", "ward"),
+        ("rollup_community_area", "community_area"),
+        ("rollup_neighborhood", "neighborhood"),
+    ):
         null_rows = built.execute(
             f"SELECT sum(incidents) FROM {table} WHERE {column} IS NULL"
         ).fetchone()[0]
         assert null_rows == 1, f"{table} dropped its null-{column} bucket"
+
+
+def test_every_built_rollup_table_is_registered(built):
+    """A table the SQL creates but ROLLUP_TABLES omits is invisible to the router.
+
+    It would still be built, still be correct, and still never be queried -- and
+    every invariant test here iterates ROLLUP_TABLES, so it would go unchecked
+    too. Comparing what exists against what is declared catches the omission that
+    adding a table and forgetting the tuple produces.
+    """
+    built_tables = {
+        name
+        for (name,) in built.execute("SHOW TABLES").fetchall()
+        if name.startswith("rollup_") and name != "rollup_meta"
+    }
+    assert built_tables == set(rollups.ROLLUP_TABLES) | {rollups.CODE_MONTH_TABLE}
+
+
+def test_neighborhood_rollup_separates_the_neighborhoods(built):
+    """Guard against a rollup that groups but does not actually distinguish.
+
+    Asserted relationally rather than as one absolute count: a total of 5 would
+    be satisfied by every row landing in one bucket, which is the failure this is
+    looking for.
+    """
+    rows = dict(built.execute(
+        """SELECT coalesce(neighborhood, '<null>'), sum(incidents)
+           FROM rollup_neighborhood GROUP BY 1"""
+    ).fetchall())
+    assert rows == {"Loop": 3, "Wicker Park": 1, "<null>": 1}
 
 
 def test_beat_totals_do_not_depend_on_district(built):

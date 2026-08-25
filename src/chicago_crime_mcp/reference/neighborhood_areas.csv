@@ -1,0 +1,105 @@
+neighborhood,community_area_number,community_area,share_of_neighborhood_in_ca,share_of_ca_covered_by_neighborhood
+Albany Park,14,ALBANY PARK,1.0,1.0
+Andersonville,77,EDGEWATER,1.0,0.1978
+Archer Heights,57,ARCHER HEIGHTS,1.0,1.0
+Armour Square,34,ARMOUR SQUARE,1.0,0.6174
+Ashburn,70,ASHBURN,1.0,1.0
+Auburn Gresham,71,AUBURN GRESHAM,1.0,1.0
+Austin,25,AUSTIN,1.0,0.8534
+Avalon Park,45,AVALON PARK,1.0,1.0
+Avondale,21,AVONDALE,1.0,1.0
+Belmont Cragin,19,BELMONT CRAGIN,1.0,1.0
+Beverly,72,BEVERLY,1.0,1.0
+Boystown,6,LAKE VIEW,1.0,0.0386
+Bridgeport,60,BRIDGEPORT,1.0,1.0
+Brighton Park,58,BRIGHTON PARK,1.0,1.0
+Bucktown,22,LOGAN SQUARE,1.0,0.2878
+Burnside,47,BURNSIDE,1.0,1.0
+Calumet Heights,48,CALUMET HEIGHTS,1.0,1.0
+Chatham,44,CHATHAM,1.0,1.0
+Chicago Lawn,66,CHICAGO LAWN,1.0,1.0
+Chinatown,34,ARMOUR SQUARE,1.0,0.3826
+Clearing,64,CLEARING,1.0,1.0
+Douglas,35,DOUGLAS,1.0,1.0
+Dunning,17,DUNNING,1.0,1.0
+East Side,52,EAST SIDE,1.0,1.0
+East Village,24,WEST TOWN,1.0,0.0553
+Edgewater,77,EDGEWATER,1.0,0.8022
+Edison Park,9,EDISON PARK,1.0,1.0
+Englewood,67,WEST ENGLEWOOD,0.5066,1.0
+Englewood,68,ENGLEWOOD,0.4934,1.0
+Fuller Park,37,FULLER PARK,1.0,1.0
+Gage Park,63,GAGE PARK,1.0,1.0
+Galewood,25,AUSTIN,0.9985,0.1466
+Garfield Park,27,EAST GARFIELD PARK,0.5989,1.0
+Garfield Park,26,WEST GARFIELD PARK,0.4011,1.0
+Garfield Ridge,56,GARFIELD RIDGE,1.0,1.0
+Gold Coast,8,NEAR NORTH SIDE,1.0,0.0935
+Grand Boulevard,38,GRAND BOULEVARD,1.0,1.0
+Grand Crossing,69,GREATER GRAND CROSSING,1.0,1.0
+Grant Park,32,LOOP,1.0,0.1937
+Greektown,28,NEAR WEST SIDE,1.0,0.0104
+Hegewisch,55,HEGEWISCH,1.0,1.0
+Hermosa,20,HERMOSA,1.0,1.0
+Humboldt Park,23,HUMBOLDT PARK,0.8038,1.0
+Humboldt Park,24,WEST TOWN,0.1962,0.1923
+Hyde Park,41,HYDE PARK,1.0,0.8615
+Irving Park,16,IRVING PARK,1.0,1.0
+Jackson Park,42,WOODLAWN,0.7347,0.2992
+Jackson Park,41,HYDE PARK,0.2653,0.1385
+Jefferson Park,11,JEFFERSON PARK,1.0,1.0
+Kenwood,39,KENWOOD,1.0,1.0
+Lake View,6,LAKE VIEW,1.0,0.8778
+Lincoln Park,7,LINCOLN PARK,1.0,0.7632
+Lincoln Square,4,LINCOLN SQUARE,1.0,1.0
+"Little Italy, UIC",28,NEAR WEST SIDE,1.0,0.4503
+Little Village,30,SOUTH LAWNDALE,1.0,1.0
+Logan Square,22,LOGAN SQUARE,1.0,0.7122
+Loop,32,LOOP,1.0,0.6795
+Lower West Side,31,LOWER WEST SIDE,1.0,1.0
+Magnificent Mile,8,NEAR NORTH SIDE,1.0,0.0115
+Mckinley Park,59,MCKINLEY PARK,1.0,1.0
+Millenium Park,32,LOOP,1.0,0.0599
+Montclare,18,MONTCLARE,0.9999,0.9984
+Morgan Park,75,MORGAN PARK,1.0,1.0
+Mount Greenwood,74,MOUNT GREENWOOD,1.0,1.0
+Museum Campus,33,NEAR SOUTH SIDE,1.0,0.3118
+Near South Side,33,NEAR SOUTH SIDE,1.0,0.6882
+New City,61,NEW CITY,1.0,1.0
+North Center,5,NORTH CENTER,1.0,1.0
+North Lawndale,29,NORTH LAWNDALE,1.0,1.0
+North Park,13,NORTH PARK,1.0,1.0
+Norwood Park,10,NORWOOD PARK,1.0,1.0
+O'Hare,76,OHARE,1.0,1.0
+Oakland,36,OAKLAND,1.0,1.0
+Old Town,7,LINCOLN PARK,0.5256,0.1181
+Old Town,8,NEAR NORTH SIDE,0.4744,0.1228
+Portage Park,15,PORTAGE PARK,1.0,1.0
+Printers Row,32,LOOP,1.0,0.0467
+Pullman,50,PULLMAN,1.0,1.0
+River North,8,NEAR NORTH SIDE,1.0,0.5056
+Riverdale,54,RIVERDALE,1.0,1.0
+Rogers Park,1,ROGERS PARK,1.0,1.0
+Roseland,49,ROSELAND,1.0,1.0
+Rush & Division,8,NEAR NORTH SIDE,1.0,0.0455
+"Sauganash,Forest Glen",12,FOREST GLEN,1.0,1.0
+Sheffield & DePaul,7,LINCOLN PARK,1.0,0.1187
+South Chicago,46,SOUTH CHICAGO,1.0,1.0
+South Deering,51,SOUTH DEERING,1.0,1.0
+South Shore,43,SOUTH SHORE,1.0,1.0
+Streeterville,8,NEAR NORTH SIDE,0.9476,0.2211
+Streeterville,32,LOOP,0.0524,0.0202
+Ukrainian Village,24,WEST TOWN,1.0,0.0833
+United Center,28,NEAR WEST SIDE,1.0,0.2052
+Uptown,3,UPTOWN,1.0,1.0
+Washington Heights,73,WASHINGTON HEIGHTS,1.0,1.0
+Washington Park,40,WASHINGTON PARK,1.0,1.0
+West Elsdon,62,WEST ELSDON,1.0,1.0
+West Lawn,65,WEST LAWN,1.0,1.0
+West Loop,28,NEAR WEST SIDE,1.0,0.3341
+West Pullman,53,WEST PULLMAN,1.0,1.0
+West Ridge,2,WEST RIDGE,1.0,1.0
+West Town,24,WEST TOWN,1.0,0.4587
+Wicker Park,24,WEST TOWN,1.0,0.2105
+Woodlawn,42,WOODLAWN,1.0,0.7008
+Wrigleyville,6,LAKE VIEW,1.0,0.0836
