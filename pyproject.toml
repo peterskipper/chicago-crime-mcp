@@ -54,8 +54,13 @@ eval = [
 # validated by the offline unit tests -- a case naming a check that does not
 # exist would otherwise assert nothing and report a pass.
 dev = [
+    "mypy>=1.11",
+    # Real types for the ingest layer's DataFrame use: pandas keeps its stubs
+    # in a separate distribution, so without this every pandas call is opaque.
+    "pandas-stubs>=2.2",
     "pytest>=8.3",
     "pyyaml>=6.0",
+    "types-PyYAML>=6.0",
     "ruff>=0.6",
 ]
 
@@ -74,6 +79,44 @@ src = ["src", "scripts", "tests"]
 [tool.ruff.lint]
 # pycodestyle, pyflakes, isort, pyupgrade, flake8-bugbear
 select = ["E", "F", "I", "UP", "B"]
+
+# Type checking. Deliberately NOT strict: the codebase was annotated as it was
+# written but never checked, so the first pass is about finding real defects,
+# not about annotating every local. `disallow_untyped_defs` and friends are the
+# ratchet to tighten later, one flag at a time, once this baseline holds.
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "evals", "tests", "scripts"]
+# The signal that the ratchet is worth turning: an ignore that has stopped
+# being needed, or a cast that never was, should fail rather than accumulate.
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+# Every function must be annotated -- which is also what makes its *body* get
+# checked at all, since mypy skips the body of an unannotated function. Free
+# here: `src/` and `evals/` already satisfied this on the day it was turned on,
+# and `scripts/` needed exactly one annotation. `tests/` is exempt below.
+disallow_untyped_defs = true
+
+# pyarrow ships no type information at all -- no `py.typed` marker, no stub
+# distribution -- so without this every import of it is an error before any of
+# our own code is checked. A whole-library exemption stated in one place, not a
+# scatter of `# type: ignore` comments: calls into pyarrow are unchecked. pandas
+# is NOT here; `pandas-stubs` is a dev dependency and the ingest layer's
+# DataFrame use is checked for real.
+[[tool.mypy.overrides]]
+module = ["pyarrow.*"]
+ignore_missing_imports = true
+
+# `tests/` is the one exemption, and it is a deliberate trade: annotating 597
+# test signatures buys nothing, because what a test asserts is checked by
+# running it. Their bodies stay unchecked as a consequence -- measured at 152
+# would-be errors, ~129 of them `arg-type` on test doubles that are duck-typed
+# on purpose (a `SimpleNamespace` standing in for a `MiddlewareContext`).
+# Satisfying those would mean loosening production types to suit the suite.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -19,6 +19,7 @@ from tests.helpers import StubLocator
 # scripts/ is not an importable package, so load the module by path.
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "retag_parquet.py"
 _spec = importlib.util.spec_from_file_location("retag_parquet", _SCRIPT)
+assert _spec is not None and _spec.loader is not None, f"cannot load {_SCRIPT}"
 retag_parquet = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(retag_parquet)
 

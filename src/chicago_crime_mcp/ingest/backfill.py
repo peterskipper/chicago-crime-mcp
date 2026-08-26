@@ -164,8 +164,12 @@ def backfill(
     # 2.3 MB parse, so it happens once here and is threaded through every year.
     # Only a locator we opened ourselves gets closed here; an injected one
     # belongs to the caller.
-    owned = NeighborhoodBoundaries.load() if boundaries is None else None
-    locator = boundaries if boundaries is not None else owned
+    owned: NeighborhoodBoundaries | None
+    locator: schema.PointLocator
+    if boundaries is None:
+        owned = locator = NeighborhoodBoundaries.load()
+    else:
+        owned, locator = None, boundaries
     try:
         results = []
         for year in range(start_year, end_year + 1):

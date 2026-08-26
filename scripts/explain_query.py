@@ -135,7 +135,32 @@ class Measurement:
         return self.hit + self.read
 
 
-def _walk(node: dict):
+def _scalar(conn: psycopg.Connection, sql: str, params: Any = None) -> Any:
+    """Run a one-row, one-column query and return that value.
+
+    ``fetchone`` is typed as optional and really can return ``None`` -- for a
+    query that matched nothing. Every use here is an aggregate, a catalog
+    lookup or an ``EXPLAIN``, all of which always produce a row, so a missing
+    one means the query itself is wrong and deserves to say so.
+
+    Args:
+        conn: An open connection.
+        sql: A query returning a single row and a single column.
+        params: Bound parameters, if any.
+
+    Returns:
+        That single value.
+
+    Raises:
+        RuntimeError: If the query returned no row.
+    """
+    row = conn.execute(sql, params).fetchone()
+    if row is None:
+        raise RuntimeError(f"query returned no row: {sql}")
+    return row[0]
+
+
+def _walk(node: dict) -> Iterator[dict]:
     """Yield every node in a plan tree, depth first."""
     yield node
     for child in node.get("Plans", ()):
@@ -210,9 +235,7 @@ def measure(
     """
     plans, times = [], []
     for _ in range(repeat):
-        result = conn.execute(
-            "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params
-        ).fetchone()[0][0]
+        result = _scalar(conn, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql, params)[0]
         plans.append(result["Plan"])
         times.append(result["Execution Time"])
     return _summarize(label, plans, times)
@@ -249,9 +272,11 @@ def compare(
         try:
             conn.execute(f"CREATE INDEX {CANDIDATE_INDEX} ON {table} {definition}")
             conn.execute(f"ANALYZE {table}")
-            size = conn.execute(
-                "SELECT pg_size_pretty(pg_relation_size(%s::regclass))", (CANDIDATE_INDEX,)
-            ).fetchone()[0]
+            size = _scalar(
+                conn,
+                "SELECT pg_size_pretty(pg_relation_size(%s::regclass))",
+                (CANDIDATE_INDEX,),
+            )
             found = measure(conn, sql, params, definition, repeat)
             results.append(
                 Measurement(**{**found.__dict__, "index_size": size})
@@ -415,13 +440,12 @@ def demo(conn: psycopg.Connection, repeat: int) -> None:
         conn: An open connection in autocommit mode.
         repeat: Executions per measurement.
     """
-    hood = conn.execute(
+    hood = _scalar(
+        conn,
         """SELECT neighborhood FROM incidents WHERE neighborhood IS NOT NULL
-           GROUP BY 1 ORDER BY count(*) LIMIT 1"""
-    ).fetchone()[0]
-    n = conn.execute(
-        "SELECT count(*) FROM incidents WHERE neighborhood = %s", (hood,)
-    ).fetchone()[0]
+           GROUP BY 1 ORDER BY count(*) LIMIT 1""",
+    )
+    n = _scalar(conn, "SELECT count(*) FROM incidents WHERE neighborhood = %s", (hood,))
     print(
         f"search_incidents shape, filtered to the rarest neighborhood:\n"
         f"  {hood} -- {n:,} rows.\n"

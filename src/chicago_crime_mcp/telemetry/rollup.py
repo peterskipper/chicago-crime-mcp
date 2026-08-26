@@ -550,7 +550,12 @@ def main(argv: list[str] | None = None) -> int:
             empty_by_filters(conn, min_calls=args.min_calls) if fn is empty_by_filters else fn(conn)
             for fn in REPORTS
         ]
-        total = conn.execute("SELECT count(*) FROM calls").fetchone()[0]
+        total_row = conn.execute("SELECT count(*) FROM calls").fetchone()
+        # `calls` is a view over the log files, built by `connect`, so a missing
+        # row here means the view is gone rather than that the logs are empty.
+        if total_row is None:
+            raise RuntimeError("the `calls` view is missing from the telemetry database")
+        total = total_row[0]
         print(f"{total} tool call(s) from {path}")
         print(render(reports))
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -608,7 +609,11 @@ def _digits(text: str) -> set[str]:
 #: The whole vocabulary. A case using a key not in here is rejected when the
 #: case file loads, rather than silently asserting nothing -- an eval that
 #: quietly checks less than it claims is worse than no eval.
-CHECKS = {
+#: The check registry, annotated because the join of eleven differently-typed
+#: functions is `object`, which is not callable. `Any` for the spec is the
+#: truth: each check's second argument is whatever shape its YAML block has,
+#: and the offline tests are what verify a case matches the check it names.
+CHECKS: dict[str, Callable[[Transcript, Any], list[CheckResult]]] = {
     "calls_tool": calls_tool,
     "avoids_tool": avoids_tool,
     "calls_before": calls_before,

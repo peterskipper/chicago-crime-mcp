@@ -145,6 +145,31 @@ def connect(
     return conn
 
 
+def _scalar(conn: duckdb.DuckDBPyConnection, sql: str) -> int:
+    """Run a query that returns one row of one column, and return that value.
+
+    DuckDB's ``fetchone`` is typed as returning an optional row, and it really
+    can return ``None`` -- for a query over an empty relation that is not an
+    aggregate. Every caller here counts or sums, so a missing row means the
+    relation itself is missing, which is worth a loud error rather than a
+    ``TypeError`` on the subscript.
+
+    Args:
+        conn: An open connection.
+        sql: A query returning a single row and a single column.
+
+    Returns:
+        That single value.
+
+    Raises:
+        RuntimeError: If the query returned no row.
+    """
+    row = conn.execute(sql).fetchone()
+    if row is None:
+        raise RuntimeError(f"query returned no row: {sql}")
+    return row[0]
+
+
 def build(conn: duckdb.DuckDBPyConnection) -> dict:
     """Rebuild every rollup table from the ``incidents`` view.
 
@@ -169,11 +194,8 @@ def build(conn: duckdb.DuckDBPyConnection) -> dict:
     conn.execute("COMMIT")
 
     tables = (*ROLLUP_TABLES, CODE_MONTH_TABLE, COVERAGE_TABLE)
-    summary = {
-        table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        for table in tables
-    }
-    summary["source_rows"] = conn.execute("SELECT source_rows FROM rollup_meta").fetchone()[0]
+    summary = {table: _scalar(conn, f"SELECT count(*) FROM {table}") for table in tables}
+    summary["source_rows"] = _scalar(conn, "SELECT source_rows FROM rollup_meta")
 
     for table in tables:
         log.info("built %s: %d rows", table, summary[table])

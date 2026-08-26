@@ -114,13 +114,14 @@ def retag_partition(
     """
     df = pd.read_parquet(path)
     tagged = schema.prepare(df, reference, curated, boundaries)
+    changed = {c: _changed(df, tagged, c) for c in DERIVED_COLUMNS}
     summary = {
         "rows": len(tagged),
         "located": int(tagged["neighborhood"].notna().sum()),
-        "changed": {c: _changed(df, tagged, c) for c in DERIVED_COLUMNS},
+        "changed": changed,
     }
 
-    changes = ", ".join(f"{c}={n}" for c, n in summary["changed"].items() if n)
+    changes = ", ".join(f"{c}={n}" for c, n in changed.items() if n)
     log.info(
         "%s %s: %d rows, %d located%s",
         "would rewrite" if dry_run else "rewrote",

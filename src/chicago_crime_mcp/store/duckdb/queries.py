@@ -789,10 +789,13 @@ def _coverage(
         params.extend(query.types)
     where = " AND ".join(conditions)
 
-    total = conn.execute(
+    total_row = conn.execute(
         f"SELECT coalesce(sum(incidents), 0) FROM {CODE_MONTH_TABLE} WHERE {where}",
         params,
-    ).fetchone()[0]
+    ).fetchone()
+    if total_row is None:
+        raise RuntimeError(f"{CODE_MONTH_TABLE} is missing -- run `chicago-crime-rollup` first")
+    total = total_row[0]
 
     # The null-IUCR bucket is excluded from the *numerator* only: it has no
     # meaningful lifespan to compare, but its rows still belong in the total.
