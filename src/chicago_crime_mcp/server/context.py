@@ -63,8 +63,12 @@ from chicago_crime_mcp.store.duckdb.rollups import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only, for annotations
-    import duckdb
+    # Imported by name, not as `DuckDBPyConnection`: this class has a
+    # method called `duckdb`, and a method annotation is resolved in class
+    # scope, so every annotation written below `def duckdb()` would find the
+    # method instead of the module.
     import psycopg
+    from duckdb import DuckDBPyConnection
 
 log = logging.getLogger(__name__)
 
@@ -121,7 +125,7 @@ class ServerContext:
         """
         self.config = config or StoreConfig.from_env()
         self._pool: object | None = None
-        self._duck: duckdb.DuckDBPyConnection | None = None
+        self._duck: DuckDBPyConnection | None = None
         self._duck_inode: int | None = None
         # Requests currently holding a cursor, and the condition the swap waits
         # on. See `duckdb()` for why the old connection has to be closed and
@@ -203,7 +207,7 @@ class ServerContext:
             yield conn
 
     @contextmanager
-    def duckdb(self) -> Iterator[duckdb.DuckDBPyConnection]:
+    def duckdb(self) -> Iterator[DuckDBPyConnection]:
         """Borrow a DuckDB cursor, reopening first if the file was swapped.
 
         A cursor rather than the connection itself: cursors over one DuckDB
@@ -233,7 +237,8 @@ class ServerContext:
             DataUnavailableError: If the context was never opened.
         """
         with self._lock:
-            if self._duck is None:
+            conn = self._duck
+            if conn is None:
                 raise DataUnavailableError(
                     "the server is not connected to the rollup database",
                     hint="This is a server-side problem, not a problem with the request.",
@@ -249,10 +254,9 @@ class ServerContext:
                     )
                 elif self._current_inode() != self._duck_inode:
                     log.info("rollup database was replaced; reopening")
-                    self._duck.close()
+                    conn.close()
                     self._duck = None
-                    self._open_duckdb()
-            conn = self._duck
+                    conn = self._open_duckdb()
             self._readers += 1
         cursor = conn.cursor()
         try:
@@ -281,8 +285,12 @@ class ServerContext:
                     self._vocabulary = vocabulary_module.load(conn)
                 return self._vocabulary
 
-    def _open_duckdb(self) -> None:
+    def _open_duckdb(self) -> DuckDBPyConnection:
         """Open the rollup database read-only, warm it, and record its inode.
+
+        Returns:
+            The newly opened connection, which is also stored on the instance.
+            Returned as well so the reopen path can borrow it directly.
 
         Raises:
             DataUnavailableError: If the file is absent or holds no build.
@@ -318,8 +326,9 @@ class ServerContext:
         self._duck_inode = self._current_inode()
         # Anything derived from the previous build is now stale by definition.
         self._vocabulary = None
+        return conn
 
-    def _warm(self, conn: duckdb.DuckDBPyConnection) -> None:
+    def _warm(self, conn: DuckDBPyConnection) -> None:
         """Check the relations exist, then absorb the first-aggregate cost.
 
         The warm-up is **one real, tiny aggregate**, and nothing cheaper works.

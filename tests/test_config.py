@@ -106,7 +106,7 @@ def test_there_is_no_cache_tier():
 def test_config_is_frozen():
     cfg = StoreConfig()
     try:
-        cfg.database_url = "mutated"  # type: ignore[misc]
+        cfg.database_url = "mutated"
     except AttributeError:
         return
     raise AssertionError("StoreConfig should be immutable")

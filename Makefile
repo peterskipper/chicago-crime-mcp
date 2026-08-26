@@ -1,4 +1,4 @@
-.PHONY: install lint test ci
+.PHONY: install lint typecheck test ci
 
 # Prefer the repo's virtualenv, fall back to whatever python is on PATH (CI
 # installs into the runner's own environment and has no .venv). Invoking the
@@ -14,7 +14,10 @@ install:
 lint:
 	$(PY) -m ruff check src/ tests/ evals/ scripts/
 
+typecheck:
+	$(PY) -m mypy
+
 test:
 	$(PY) -m pytest tests/
 
-ci: lint test
+ci: lint typecheck test

@@ -88,10 +88,18 @@ class _RouteLike(Protocol):
     Declared structurally rather than imported so this module stays importable
     with only Pydantic -- the store's query modules pull in ``duckdb`` and
     ``psycopg``, and the envelope has no business requiring either.
+
+    The members are read-only properties rather than plain attributes because a
+    protocol's plain attribute is *settable*, and neither ``Route`` nor
+    ``Timing`` -- both frozen dataclasses -- can satisfy that. The envelope only
+    ever reads them.
     """
 
-    reason: str
-    elapsed_ms: float
+    @property
+    def reason(self) -> str: ...
+
+    @property
+    def elapsed_ms(self) -> float: ...
 
 
 class RouteInfo(BaseModel):

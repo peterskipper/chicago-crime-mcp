@@ -175,38 +175,43 @@ class NeighborhoodIndex:
         self.names: tuple[str, ...] = tuple(sorted(areas["neighborhood"].unique()))
         self._by_key = {match_key(name): name for name in self.names}
 
+        # Rows are read as plain dicts rather than through `itertuples()`: both
+        # reference tables are small (hundreds of rows, loaded once), and a dict
+        # of cell values is a real boundary out of pandas -- `itertuples()`
+        # hands back attributes typed as every scalar pandas can hold, so the
+        # coercions below could not be checked against it.
         ordered = areas.sort_values("share_of_neighborhood_in_ca", ascending=False)
         self._areas: dict[str, tuple[ContainingArea, ...]] = {
-            name: tuple(
+            str(name): tuple(
                 ContainingArea(
-                    number=int(row.community_area_number),
-                    name=row.community_area,
-                    share_of_neighborhood=float(row.share_of_neighborhood_in_ca),
-                    share_of_area=float(row.share_of_ca_covered_by_neighborhood),
+                    number=int(row["community_area_number"]),
+                    name=row["community_area"],
+                    share_of_neighborhood=float(row["share_of_neighborhood_in_ca"]),
+                    share_of_area=float(row["share_of_ca_covered_by_neighborhood"]),
                 )
-                for row in group.itertuples()
+                for row in group.to_dict("records")
             )
             for name, group in ordered.groupby("neighborhood", sort=False)
         }
 
         self._aliases: dict[str, Candidate] = {}
-        for row in aliases.itertuples():
-            key = match_key(row.alias)
-            if row.match_kind == "alias":
-                self._aliases[key] = self._exact(row.target_value, "alias")
+        for row in aliases.to_dict("records"):
+            key = match_key(row["alias"])
+            if row["match_kind"] == "alias":
+                self._aliases[key] = self._exact(row["target_value"], "alias")
             else:
                 self._aliases[key] = Candidate(
                     match_kind="containing",
-                    label=row.alias,
+                    label=row["alias"],
                     geography="community_area",
-                    value=int(row.target_value),
+                    value=int(row["target_value"]),
                     # No polygon exists for this place, so there is nothing to
                     # intersect the community area with: the shares are not
                     # merely unknown, they are unmeasurable.
                     containing_areas=(
                         ContainingArea(
-                            number=int(row.target_value),
-                            name=row.target_label,
+                            number=int(row["target_value"]),
+                            name=row["target_label"],
                             share_of_neighborhood=None,
                             share_of_area=None,
                         ),
@@ -272,7 +277,9 @@ class NeighborhoodIndex:
 
     def _suggest(self, key: str) -> tuple[Candidate, ...]:
         """Rank near misses over the stored names and the alias keys alike."""
-        known = {**self._by_key, **self._aliases}
+        # One dict of both shapes: `_by_key` holds names, `_aliases` holds
+        # already-built candidates, and the loop below branches on which.
+        known: dict[str, str | Candidate] = {**self._by_key, **self._aliases}
         near = difflib.get_close_matches(
             key, known, n=MAX_SUGGESTIONS, cutoff=NEAREST_CUTOFF
         )

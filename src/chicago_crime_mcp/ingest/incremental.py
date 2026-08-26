@@ -201,8 +201,12 @@ def incremental_sync(
     if len(pulled):
         # The same pipeline the backfill runs, so a partition written by a
         # nightly sync is indistinguishable from one written by a full pull.
-        owned = NeighborhoodBoundaries.load() if boundaries is None else None
-        locator = boundaries if boundaries is not None else owned
+        owned: NeighborhoodBoundaries | None
+        locator: schema.PointLocator
+        if boundaries is None:
+            owned = locator = NeighborhoodBoundaries.load()
+        else:
+            owned, locator = None, boundaries
         try:
             pulled = schema.prepare(
                 pulled,

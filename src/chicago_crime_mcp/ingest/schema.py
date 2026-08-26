@@ -39,7 +39,7 @@ Docstrings follow the Google Python style.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol, cast
 
 import pandas as pd
 
@@ -113,7 +113,11 @@ def normalize_iucr(code: object) -> str | None:
         The 4-character zero-padded code (e.g. ``"281"`` -> ``"0281"``), or
         ``None`` if the input is null/blank.
     """
-    if pd.isna(code):  # handles None, float NaN, and pandas NA
+    # `object` is the honest parameter type -- this runs over raw feed cells --
+    # but pandas-stubs types `isna` only for the scalars pandas itself knows,
+    # so `object` matches no overload. The cast asserts what the docstring
+    # already says; the runtime call is unchanged and still handles anything.
+    if pd.isna(cast(Any, code)):  # handles None, float NaN, and pandas NA
         return None
     s = str(code).strip()
     return s.zfill(4) if s else None
